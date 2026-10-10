@@ -1,5 +1,9 @@
 # Continuation memory — October 10, 2026
 
+## Latest integration state
+
+At the user’s request, the local six-zone implementation and teammate commit `482528f` have been combined in one repository. Use the root README for current setup and `gx10/README.md` for the retained Nemotron backend. Both clients and both test suites are present. The deployment paths and earlier no-merge statements below are historical; no remote running service was changed by this source merge.
+
 Read this file before continuing the implementation. The user explicitly requested saving this work for a new chat. No new chat was created. Do not restart setup or repeat approval questions already resolved below.
 
 ## Objective and constraints

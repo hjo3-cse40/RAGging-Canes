@@ -6,3 +6,6 @@ artifacts/
 *.engine
 private/
 firmware/PrivateConfig.h
+*.pyc
+*.log
+*.pid

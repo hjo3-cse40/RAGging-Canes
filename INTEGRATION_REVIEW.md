@@ -1,5 +1,9 @@
 # GitHub integration and model tests — October 10, 2026
 
+## Integration update
+
+The implementations have now been merged into one checkout, preserving both Git histories. The three shared-file conflicts were resolved: combined ignore rules, a shared root setup guide, and separate five-/six-zone firmware instructions. Detailed Nemotron instructions are in `gx10/README.md`. The report below describes the pre-merge investigation; its isolated directories remain benchmark evidence, not the primary development checkout. Both backend protocols remain unchanged.
+
 Reviewed teammate commit `482528f` against local base `6d2bb01` and the uncommitted six-zone implementation. GitHub was fetched; the laptop branch was not merged, reset, committed, or pushed. Tests ran in an isolated combined snapshot, preserving both existing GX10 deployments.
 
 ## Conflicts and integration approach

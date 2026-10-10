@@ -1,6 +1,6 @@
 # RAGging Canes
 
-For the current implementation state, measured results, access details, and remaining work, read [HANDOFF.md](HANDOFF.md).
+Both model backends are included in this repository. Start with the backend table and commands below. [Integration review](INTEGRATION_REVIEW.md) records the comparison tests; [HANDOFF.md](HANDOFF.md) preserves deployment history.
 
 A wearable obstacle-awareness prototype that turns camera observations into directional vibration cues. Built for the ASUS Local AI track at the UCSC AI Hackathon, October 10–11, 2026.
 
@@ -8,13 +8,59 @@ The concept is a baseball cap with a Freenove ESP32-S3 WROOM board, a camera, an
 
 ## Project status
 
-This repository includes the project plan and an initial Python JPEG receiver, snapshot puller, and YOLO detection adapter in `software/`. See [software setup and verification](software/README.md). Local receiver tests pass. Saved-image and live YOLO inference have run on the GX10 CPU and GPU using actual ESP32 JPEGs. A six-zone receive-only ESP32 client is prepared in `firmware/`, but has not been flashed or tested with motors. GX10 GPU inference is verified. Training, wiring diagrams, and an integrated haptic demo remain unverified.
+The repository includes two independently runnable vision backends and their matching receive-only ESP32 clients. Both have been tested on GX10, and the combined software suite passes 10 tests. Motor wiring, full-sketch integration, training, and an integrated wearable demo remain pending.
 
-Early manual image experiments on the GX10 produced useful scene descriptions. A detailed response took roughly six seconds; later testing with `nemotron3:33b` and thinking disabled felt nearly instant. These are informal observations, not end-to-end benchmarks. Fresh-image testing is still needed to distinguish live performance from model warm-up and repeated-image caching effects.
+| Backend | Launch module | Output / default expiry | ESP32 client | Setup |
+| --- | --- | --- | --- | --- |
+| YOLO26n | `software.vision` | Six pixel-strip zones / 1000 ms | `firmware/SixZoneClient.h` | [YOLO setup](software/README.md) |
+| Nemotron `nemotron3:33b` via Ollama | `gx10.service` | Five pixel-strip zones / 2500 ms | `firmware/ZoneClient.h` | [Nemotron setup](gx10/README.md) |
+
+The current hardware target is six directional motors. The five-zone Nemotron backend remains available for the existing teammate setup; its client is not interchangeable with the six-zone client. The comparison tool can request six zones from Nemotron, but this does not change the production Nemotron service.
+
+## Run either backend from one checkout
+
+Clone this repository, or use `git pull --ff-only` in a clean checkout. On a machine with local edits, commit or stash them and reconcile any conflicts first. Run commands from the repository root on GX10. Replace `ESP32_IP` with the current camera address.
+
+Nemotron uses Python's standard library and an existing Ollama installation containing `nemotron3:33b`:
+
+```bash
+python3 -m gx10.service --camera-url http://ESP32_IP/capture \
+  --bind 127.0.0.1 --port 8000
+```
+
+YOLO uses the verified GPU environment described in [software setup](software/README.md):
+
+```bash
+.venv/bin/python -m software.vision pull --detect --device 0 \
+  --url http://ESP32_IP/capture --host 127.0.0.1 --port 8001
+```
+
+Both commands expose `/command` and `/health` locally. Use an SSH tunnel for laptop inspection. YOLO requires a token file for LAN access and exposes only commands/readiness on that interface; the legacy Nemotron LAN endpoint has no authentication. Refer to the backend setup documents before connecting the matching ESP32 receiver.
+
+Use one active camera loop at a time for repeatable latency tests. Different ports prevent binding conflicts but do not prevent camera or GPU contention. Stop the current loop before switching, or keep YOLO idle with `--idle-without-client` until a command client polls. Existing GX10 deployments are not automatically replaced by pulling this repository.
+
+Run all software tests with Pillow installed (GPU/model weights are not needed):
+
+```bash
+python3 -m pip install 'Pillow>=11,<13'
+python3 -m unittest discover -s tests -v
+```
+
+Compare both models on the same saved images using the GPU environment:
+
+```bash
+.venv/bin/python -m software.compare_models \
+  --images /absolute/path/image1.jpg /absolute/path/image2.jpg \
+  --nemotron-zones 6 --output artifacts/comparison
+```
+
+Use a fresh output directory for each run. `--nemotron-zones 5` reproduces the original Nemotron classes and zones; six-zone mode aligns its requested classes with YOLO's person/chair defaults. [Comparison details](INTEGRATION_REVIEW.md) explain timing limits and bounded live-camera testing. For a new checkout, use its own repository path in those historical deployment-specific commands.
+
+On three shared fresh frames, median processing was about 25 ms for YOLO and 720 ms for Nemotron; camera delivery had two timeouts in five attempts. A separate YOLO live run completed four of five captures with a 448 ms median fetch-to-result time. These small samples establish execution, not accuracy or scene-change-to-vibration performance.
 
 ## Intended experience
 
-The original plan used five positions; the current hardware constraint is six directional vibration motors covering the visible forward region, with a maximum coverage of 180°. The implementation returns six zone values. Actual lens coverage and pixel-to-angle calibration still need measurement before labeling them equal 30° sectors. A straight-ahead object spanning the midpoint cues the middle pair.
+The original plan used five positions; the current hardware constraint is six directional vibration motors covering the visible forward region, with a maximum coverage of 180°. The YOLO implementation returns six zone values; the retained Nemotron service returns five. Actual lens coverage and pixel-to-angle calibration still need measurement before labeling them equal 30° sectors. A straight-ahead object spanning the midpoint cues the middle pair.
 
 The original five-position scheme was:
 
@@ -82,7 +128,7 @@ The proposed compact vision output is an array ordered left to right:
 
 An object may occupy multiple zones. Candidate demo objects include people, chairs, tables, and boxes; the final supported classes depend on the selected model and training dataset. Unknown results require distinct handling and must not be silently converted to a clear scene.
 
-The initial service implements six-value results with frame identifiers, unknown states, and observation expiry. See `software/README.md` for the HTTP contract and its freshness limits. These results are not electrical motor commands. ESP32 integration, haptic pulse patterns, and priority between proximity, direction, and status cues still need hardware validation.
+The YOLO service implements six-value results with frame identifiers, unknown states, and observation expiry. See `software/README.md` for the HTTP contract and its freshness limits. These results are not electrical motor commands. ESP32 integration, haptic pulse patterns, and priority between proximity, direction, and status cues still need hardware validation.
 
 ## Latency plan
 
@@ -135,11 +181,13 @@ Replace both placeholders with the assigned values. Keep credentials and device-
 - [ ] Confirm component models, power requirements, and GPIO assignments.
 - [x] Capture and decode a JPEG from the ESP32 snapshot endpoint.
 - [ ] Drive one motor and verify ultrasonic readings independently.
-- [ ] Establish laptop and ESP32 connectivity to the GX10.
+- [x] Establish laptop SSH and GX10 camera connectivity.
+- [ ] Verify ESP32 command receipt on hardware.
 - [ ] Benchmark candidate vision models on fresh cap-camera images.
 - [x] Implement a JPEG receiver and validated six-zone responses.
 - [ ] Connect left/center/right feedback, then expand to six distinguishable zones.
-- [ ] Add command expiry, connection-loss behavior, and sensor-error handling.
+- [x] Add server command expiry and camera/model failure handling.
+- [ ] Verify firmware timeout behavior and ultrasonic sensor-error handling.
 - [ ] Complete and document a GX10 training run.
 - [ ] Measure the full pipeline and rehearse a stationary demonstration.
 - [ ] Record a backup demo and preserve the working configuration.

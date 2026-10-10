@@ -1,0 +1,8 @@
+.venv/
+.venv-cpu/
+__pycache__/
+artifacts/
+*.pt
+*.engine
+private/
+firmware/PrivateConfig.h

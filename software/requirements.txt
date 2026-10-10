@@ -1,0 +1,2 @@
+Pillow>=11,<13
+ultralytics>=8.4,<9

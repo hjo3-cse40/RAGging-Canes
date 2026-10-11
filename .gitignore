@@ -9,3 +9,4 @@ firmware/PrivateConfig.h
 *.pyc
 *.log
 *.pid
+.venv-dashboard/

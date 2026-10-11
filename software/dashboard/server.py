@@ -15,7 +15,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageDraw
 from software.vision import Pipeline, MAX_BYTES, decode_jpeg, zone_states
-from software.predictor import RIFEInterpolator, TrajectoryPredictor
+from software.predictor import (
+    DecisionForecaster,
+    RIFEInterpolator,
+    TrajectoryPredictor,
+    six_to_three_zones,
+)
 from .geometry import calibration, project
 
 STATIC = Path(__file__).parent
@@ -77,7 +82,8 @@ class StreamBroadcaster:
 
 class State:
     def __init__(self, mode, output, max_age=2.5, config=None, rotate=0,
-                 rife_factor=0, device='auto'):
+                 rife_factor=0, device='auto', decision_backend='laya',
+                 jev_key_file='private/jev_api_key.txt', start_decision_worker=False):
         self.lock = threading.Lock()
         self.mode, self.output, self.max_age = mode, Path(output), max_age
         self.rotate = rotate
@@ -92,6 +98,13 @@ class State:
         self.broadcaster = StreamBroadcaster()
         self.predictor = TrajectoryPredictor()
         self.interpolator = RIFEInterpolator(factor=rife_factor, device=device)
+        self.decision_forecaster = DecisionForecaster(
+            backend=decision_backend,
+            device=device,
+            jev_key_file=jev_key_file,
+        )
+        if start_decision_worker:
+            self.decision_forecaster.start()
 
     def publish(self, data, result, started, generation, frame_bgr=None):
         with self.lock:
@@ -113,8 +126,15 @@ class State:
                 raw_objects, width, height, timestamp=started, calibration_config=config
             )
 
+        self.decision_forecaster.submit(scenario)
+        latest_dec = self.decision_forecaster.latest()
+        if latest_dec is not None:
+            scenario['decision'] = latest_dec
+
         frames_out, rife_info = self.interpolator.push_and_interpolate_jpegs(data, frame_bgr=frame_bgr)
         now = time.monotonic()
+        zones_6 = result.get('zones', [-1] * 6)
+        zones_3 = result.get('zones_3') or six_to_three_zones(zones_6)
         with self.lock:
             if self.paused or generation != self.generation:
                 return
@@ -128,11 +148,13 @@ class State:
             avg_gap_s = max(0.08, min(1.20, avg_gap_s))
             self.frame = {
                 **result,
+                'zones_3': zones_3,
                 'objects': enriched_objects,
                 'scenario': scenario,
                 'predicted_zones_1s': scenario['predicted_zones_1s'],
                 'predicted_zones_2s': scenario['predicted_zones_2s'],
                 'predicted_zones_3s': scenario['predicted_zones_3s'],
+                'predicted_zones_3_2s': scenario['predicted_zones_3_2s'],
                 'rife': rife_info,
                 'image': base64.b64encode(data).decode('ascii'),
             }
@@ -161,8 +183,13 @@ class State:
             )
             rife_mult = (1 + self.interpolator.factor) if self.interpolator.factor > 0 else 1
             stream_fps = round(capture_fps * rife_mult, 2) if valid and capture_fps > 0 else 0
-            scenario = frame.get('scenario') if valid and frame else None
+            scenario = dict(frame.get('scenario')) if valid and frame and frame.get('scenario') else None
+            decision = self.decision_forecaster.latest()
+            if scenario and decision:
+                scenario['decision'] = decision
             rife_info = frame.get('rife') if frame else {'rife_enabled': self.interpolator.factor > 0, 'factor': self.interpolator.factor, 'backend': self.interpolator.backend}
+            zones_6 = frame['zones'] if valid else [-1]*6
+            zones_3 = frame.get('zones_3', six_to_three_zones(zones_6)) if valid else [-1]*3
             return {'mode': self.mode, 'status': status, 'valid': valid,
                     'error': self.error, 'age_ms': round(age*1000) if age is not None else None,
                     'max_age_ms': round(self.max_age*1000), 'frame': frame,
@@ -170,10 +197,13 @@ class State:
                     'stream_fps': stream_fps,
                     'rife': rife_info,
                     'scenario': scenario,
+                    'decision': decision,
+                    'decision_backend': self.decision_forecaster.requested_backend,
                     'predicted_zones_1s': scenario['predicted_zones_1s'] if scenario else [-1]*6,
                     'predicted_zones_2s': scenario['predicted_zones_2s'] if scenario else [-1]*6,
                     'predicted_zones_3s': scenario['predicted_zones_3s'] if scenario else [-1]*6,
-                    'objects': objects, 'zones': frame['zones'] if valid else [-1]*6,
+                    'predicted_zones_3_2s': (decision['recommended_pre_alert_zones_3'] if decision else scenario.get('predicted_zones_3_2s', [-1]*3)) if scenario else [-1]*3,
+                    'objects': objects, 'zones': zones_6, 'zones_3': zones_3,
                     'calibration': config, 'map_mode': 'floor_estimate' if config else 'bearing_only',
                     'rotate': self.rotate}
 
@@ -221,6 +251,21 @@ class State:
             self.interpolator.factor = factor
             self.interpolator.stats['factor'] = factor
         self.interpolator.reset()
+
+    def set_decision_backend(self, backend):
+        self.decision_forecaster.set_backend(backend)
+        self.decision_forecaster.start()
+        with self.lock:
+            scen = dict(self.frame.get('scenario')) if self.frame and self.frame.get('scenario') else None
+        if scen is not None:
+            try:
+                dec = self.decision_forecaster.evaluate_sync(scen)
+                with self.lock:
+                    if self.frame and self.frame.get('scenario'):
+                        self.frame['scenario']['decision'] = dec
+            except Exception:
+                pass
+
 
 
 
@@ -646,6 +691,11 @@ def handler_for(state):
                     if type(factor) is not int or not 0 <= factor <= 8:
                         raise ValueError('factor must be an integer between 0 and 8')
                     state.set_rife(factor)
+                elif self.path=='/api/decision':
+                    backend=payload.get('backend')
+                    if backend not in ('auto','laya','jev','kinematic'):
+                        raise ValueError('backend must be auto, laya, jev, or kinematic')
+                    state.set_decision_backend(backend)
                 elif self.path=='/api/calibration':
                     config=None if payload.get('clear') is True else calibration(payload)
                     if config and state.mode=='live':
@@ -673,6 +723,8 @@ def main():
     p.add_argument('--model',default='yolo26n.pt');p.add_argument('--device',default='0')
     p.add_argument('--rotate',type=int,choices=[0,90,180,270],default=None,help='Clockwise rotation before detection (default: 270 for live, 0 for simulation/replay)')
     p.add_argument('--rife-factor',type=int,default=0,help='RIFE optical-flow intermediate frames per capture (default: 0 / Off)')
+    p.add_argument('--decision-backend',choices=['auto','laya','jev','kinematic'],default='laya',help='System-1 decision model backend (default: laya)')
+    p.add_argument('--jev-key-file',default='private/jev_api_key.txt',help='Path to private file containing TypeSafe Jev API key')
     p.add_argument('--stream',action='store_true',help='Force continuous multipart MJPEG video stream ingestion')
     p.add_argument('--save-artifacts',action='store_true',help='Save diagnostic artifacts (latest.jpg, latest.json) to disk')
     p.add_argument('--interval',type=float,default=None,help='Delay after each frame; live defaults to 0, replay/demo to 0.5 s')
@@ -708,14 +760,26 @@ def main():
         config=calibration(payload) if payload else None
     except (ValueError,OSError) as exc:
         p.error(str(exc))
-    state=State(mode,args.output,args.max_age,config,rotate=args.rotate,rife_factor=args.rife_factor,device=args.device);stop=threading.Event()
+    state=State(
+        mode,
+        args.output,
+        args.max_age,
+        config,
+        rotate=args.rotate,
+        rife_factor=args.rife_factor,
+        device=args.device,
+        decision_backend=args.decision_backend,
+        jev_key_file=args.jev_key_file,
+        start_decision_worker=True,
+    )
+    stop=threading.Event()
     server=ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(state))
     worker=threading.Thread(target=run_source,args=(state,args,stop),daemon=True);worker.start()
     print(f'YOLO dashboard: http://127.0.0.1:{args.port} ({mode})',flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally:
-        stop.set();server.server_close();worker.join(timeout=1)
+        stop.set();state.decision_forecaster.stop();server.server_close();worker.join(timeout=1)
 
 
 if __name__=='__main__': main()

@@ -67,6 +67,14 @@
                 <option value="3">4× Smooth (3 mid)</option>
               </select>
             </label>
+            <label class="toggle" title="System-1 Decision Model for 3s hazard & 3-motor haptics">
+              <span class="control-label">Decision:</span>
+              <select id="decision-select" class="select-input" aria-label="Decision model backend">
+                <option value="laya" selected>Laya (Local Open-Source)</option>
+                <option value="jev">Jev API (TypeSafe)</option>
+                <option value="kinematic">Kinematic Only</option>
+              </select>
+            </label>
             <label class="toggle">
               <input id="boxes" type="checkbox" checked> YOLO detections
             </label>
@@ -83,11 +91,25 @@
         </div>
         <div class="camera-footer">
           <span id="resolution">—</span>
-          <span id="classes">YOLO26N + RIFE + 3S KALMAN PREDICTOR</span>
+          <span id="classes">YOLO26N + LAYA/JEV DECISION + 3-MOTOR HAPTICS</span>
         </div>
         <div class="zones-head">
-          <span>SURROUND DIRECTIONAL ZONES (SOLID = NOW · DASHED = +2S PREDICTED)</span>
-          <span>Left → Right (L3…R3)</span>
+          <span>3-MOTOR HAPTIC MVP (SOLID = VIBRATE NOW · DASHED = LAYA/JEV +3S PRE-ALERT)</span>
+          <span id="haptic-pattern-tag">LEFT · CENTER · RIGHT</span>
+        </div>
+        <div class="zones zones-3" id="zones-3"></div>
+        <div class="decision-strip" id="decision-forecast">
+          <div class="decision-toggle-group" id="decision-toggle-group" role="group" aria-label="Decision model toggle">
+            <button type="button" class="decision-pill active" data-backend="laya" id="btn-decision-laya">⚡ Local Laya</button>
+            <button type="button" class="decision-pill" data-backend="jev" id="btn-decision-jev">☁️ Jev API</button>
+            <button type="button" class="decision-pill" data-backend="kinematic" id="btn-decision-kinematic">📐 Kinematic</button>
+          </div>
+          <span class="decision-tag" id="decision-model-tag">LAYA SYSTEM-1</span>
+          <span class="decision-text" id="decision-text">Evaluating 3-keyframe (t-2s, t-1s, t0) trajectory state…</span>
+        </div>
+        <div class="zones-head sub-zones-head">
+          <span>6-SECTOR CAMERA SUB-GRID (L3…R3)</span>
+          <span>2 Sectors per Motor</span>
         </div>
         <div class="zones" id="zones"></div>
       </section>

@@ -155,11 +155,18 @@ class Pipeline:
             objects, scenario = self.predictor.update(
                 objects, width, height, timestamp=source_started
             )
+        zones_6 = zone_states(boxes, width, self.boundaries) if self.model is not None else [-1] * 6
+        zones_3 = (
+            [1 if (zones_6[0] == 1 or zones_6[1] == 1) else 0,
+             1 if (zones_6[2] == 1 or zones_6[3] == 1) else 0,
+             1 if (zones_6[4] == 1 or zones_6[5] == 1) else 0]
+            if self.model is not None else [-1, -1, -1]
+        )
         response = {
             "frame_id": frame_id,
             "status": "ok" if self.model is not None else "received_only",
-            "zones": zone_states(boxes, width, self.boundaries)
-                     if self.model is not None else [-1] * 6,
+            "zones": zones_6,
+            "zones_3": zones_3,
             "objects": objects, "bytes": len(data),
             "width": width, "height": height,
             "decode_ms": round((decoded - started) * 1000, 2),
@@ -171,6 +178,7 @@ class Pipeline:
             response["predicted_zones_1s"] = scenario["predicted_zones_1s"]
             response["predicted_zones_2s"] = scenario["predicted_zones_2s"]
             response["predicted_zones_3s"] = scenario["predicted_zones_3s"]
+            response["predicted_zones_3_2s"] = scenario.get("predicted_zones_3_2s", zones_3)
         if self.save_disk:
             # Atomic replacement prevents viewers reading a partially written image.
             temp = self.output / "latest.tmp"
@@ -217,27 +225,39 @@ def make_handler(pipeline, token=None, commands_only=False):
         def do_GET(self):
             if not self.authorized():
                 return
-            if commands_only and self.path not in ("/health", "/command"):
+            parsed_url = urllib.parse.urlsplit(self.path)
+            route_path = parsed_url.path
+            if commands_only and route_path not in ("/health", "/command"):
                 return self.send(404, {"error": "Not found"})
-            if self.path == "/health":
+            if route_path == "/health":
                 return self.send(200, {"ready": True, "detection": pipeline.model is not None})
-            if self.path == "/latest.json":
+            if route_path == "/latest.json":
                 return self.send(200 if pipeline.latest else 404,
                                  pipeline.current_result())
-            if self.path == "/command":
+            if route_path == "/command":
                 with pipeline.state_lock:
                     pipeline.last_command_poll = time.monotonic()
                 result = pipeline.current_result()
                 valid = result["status"] == "ok"
+                qs = urllib.parse.parse_qs(parsed_url.query)
+                want_3 = qs.get("zones", ["6"])[0] == "3"
+                z6 = result["zones"] if valid else [-1] * 6
+                z3 = (
+                    [1 if (z6[0] == 1 or z6[1] == 1) else 0,
+                     1 if (z6[2] == 1 or z6[3] == 1) else 0,
+                     1 if (z6[4] == 1 or z6[5] == 1) else 0]
+                    if valid else [-1, -1, -1]
+                )
                 return self.send(200, {
                     "session_id": pipeline.session_id,
                     "frame_id": result.get("command_sequence", 0),
                     "status": result["status"], "valid": valid,
-                    "zones": result["zones"] if valid else [-1] * 6,
+                    "zones": z3 if want_3 else z6,
+                    "zones_3": z3,
                     "ttl_ms": min(2500, result.get("remaining_valid_ms", 0)) if valid else 0,
                 })
-            if self.path in ("/latest.jpg", "/latest.annotated.jpg"):
-                path = pipeline.output / self.path[1:]
+            if route_path in ("/latest.jpg", "/latest.annotated.jpg"):
+                path = pipeline.output / route_path[1:]
                 if path.exists():
                     return self.send(200, path.read_bytes(), "image/jpeg")
             self.send(404, {"error": "Not found"})

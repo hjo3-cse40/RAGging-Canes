@@ -10,11 +10,14 @@ Designed for the ASUS Ascent GX10 + ESP32-S3 wearable obstacle-awareness pipelin
    to semantically validate the 3-second scenario without blocking the 25 ms YOLO reflex loop.
 """
 import base64
+from collections import deque
 import io
 import json
 import math
+import os
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -58,6 +61,31 @@ except ImportError:
 
 
 ZONE_NAMES = ["L3", "L2", "L1", "R1", "R2", "R3"]
+THREE_ZONE_NAMES = ["LEFT", "CENTER", "RIGHT"]
+
+
+def six_to_three_zones(zones_6):
+    """Fold 6 horizontal sectors [L3, L2, L1, R1, R2, R3] into 3 haptic motor zones [Left, Center, Right]."""
+    if not zones_6 or len(zones_6) != 6:
+        return [-1, -1, -1]
+    if any(z == -1 for z in zones_6):
+        return [-1, -1, -1]
+    return [
+        1 if (zones_6[0] == 1 or zones_6[1] == 1) else 0,
+        1 if (zones_6[2] == 1 or zones_6[3] == 1) else 0,
+        1 if (zones_6[4] == 1 or zones_6[5] == 1) else 0,
+    ]
+
+
+def three_to_six_zones(zones_3):
+    """Expand 3 haptic motor zones [Left, Center, Right] into 6 display sectors [L3..R3]."""
+    if not zones_3 or len(zones_3) != 3:
+        return [0, 0, 0, 0, 0, 0]
+    if any(z == -1 for z in zones_3):
+        return [-1] * 6
+    l_val, c_val, r_val = (1 if z == 1 else 0 for z in zones_3)
+    return [l_val, l_val, c_val, c_val, r_val, r_val]
+
 
 
 def _make_ifblock(in_channels=7, hidden=24):
@@ -394,12 +422,14 @@ class TrajectoryPredictor:
         self._tracks = {}
         self._next_id = 1
         self._last_ts = None
+        self._keyframes = deque(maxlen=45)
 
     def reset(self):
         with self._lock:
             self._tracks.clear()
             self._next_id = 1
             self._last_ts = None
+            self._keyframes.clear()
 
     @staticmethod
     def _iou(box_a, box_b):
@@ -716,6 +746,8 @@ class TrajectoryPredictor:
                 fut_z_idx = int(max(0, min(5, (pred_path[2]["cx"] / width) * 6))) if len(pred_path) >= 3 else curr_z_idx
                 curr_z_name = ZONE_NAMES[curr_z_idx]
                 fut_z_name = ZONE_NAMES[fut_z_idx]
+                curr_z3_name = THREE_ZONE_NAMES[curr_z_idx // 2]
+                fut_z3_name = THREE_ZONE_NAMES[fut_z_idx // 2]
 
                 if is_realistic and (curr_z_idx != fut_z_idx or approaching):
                     spd_label = (
@@ -741,6 +773,8 @@ class TrajectoryPredictor:
                     "ttc_s": ttc_s,
                     "current_zone": curr_z_name,
                     "predicted_zone_2s": fut_z_name,
+                    "current_zone_3": curr_z3_name,
+                    "predicted_zone_3_2s": fut_z3_name,
                     "predicted_boxes": pred_boxes,
                     "predicted_path": pred_path,
                 }
@@ -750,7 +784,39 @@ class TrajectoryPredictor:
             pred_zones_2s = zone_states(boxes_2s, width, self.boundaries)
             pred_zones_3s = zone_states(boxes_3s, width, self.boundaries)
 
+            curr_boxes = [(c["xyxy"][0], c["xyxy"][2]) for c in candidates]
+            curr_zones_6 = zone_states(curr_boxes, width, self.boundaries)
+            curr_zones_3 = six_to_three_zones(curr_zones_6)
+            pred_zones_3_1s = six_to_three_zones(pred_zones_1s)
+            pred_zones_3_2s = six_to_three_zones(pred_zones_2s)
+            pred_zones_3_3s = six_to_three_zones(pred_zones_3s)
+
+            # Record keyframe snapshot for t-2s, t-1s, t0 temporal strip
+            kf_tracks = []
+            for obj in enriched_objects:
+                kf_tracks.append({
+                    "id": obj["track_id"],
+                    "class": obj["class"],
+                    "zone_3": obj["current_zone_3"],
+                    "pred_zone_3": obj["predicted_zone_3_2s"],
+                    "vx": obj["velocity_px_s"][0],
+                    "vy": obj["velocity_px_s"][1],
+                    "speed_mps": obj["metric_speed_mps"],
+                    "ttc_s": obj["ttc_s"],
+                    "approaching": obj["approaching"],
+                    "realistic": obj["realistic"],
+                    "hits": obj["hits"],
+                })
+            self._keyframes.append({
+                "ts": now,
+                "tracks": kf_tracks,
+                "ego_motion": ego_motion_detected,
+                "zones_3": curr_zones_3,
+            })
+            keyframes_3s = self._extract_3_keyframes(now)
+
             total_obs = len(candidates)
+            motion_trend = "clear_or_receding"
             if total_obs == 0:
                 realism_score = 1.0
                 realistic_scene = True
@@ -768,56 +834,503 @@ class TrajectoryPredictor:
                 else:
                     risk_level = "filtered_noise"
 
+                # Derive kinematic motion_trend for the 3-motor MVP
+                real_objs = [o for o in enriched_objects if o["realistic"]]
+                if not realistic_scene or not real_objs:
+                    motion_trend = "unrealistic_or_clear"
+                else:
+                    primary = min(real_objs, key=lambda o: o["ttc_s"] if o["ttc_s"] is not None else 99.0)
+                    c3 = primary["current_zone_3"]
+                    f3 = primary["predicted_zone_3_2s"]
+                    vx_p = primary["velocity_px_s"][0]
+                    if (c3 == "LEFT" and f3 in ("CENTER", "RIGHT")) or (c3 == "CENTER" and vx_p > 35.0):
+                        motion_trend = "crossing_left_to_center"
+                    elif (c3 == "RIGHT" and f3 in ("CENTER", "LEFT")) or (c3 == "CENTER" and vx_p < -35.0):
+                        motion_trend = "crossing_right_to_center"
+                    elif primary["approaching"] and (f3 == "CENTER" or c3 == "CENTER"):
+                        motion_trend = "approaching_center"
+                    elif f3 == "LEFT" or c3 == "LEFT":
+                        motion_trend = "left_obstacle"
+                    elif f3 == "RIGHT" or c3 == "RIGHT":
+                        motion_trend = "right_obstacle"
+                    else:
+                        motion_trend = "approaching_center"
+
                 if not realistic_scene:
                     reason_str = "Camera pan / head turn compensated" if ego_motion_detected else "Transient sensor noise filtered"
                     summary = f"UNREALISTIC MOTION FILTERED · {reason_str} ({filtered_count}/{total_obs} suppressed)."
                 elif forecast_notes:
                     summary = "3S FORECAST · " + " | ".join(forecast_notes[:2])
                 else:
-                    active_names = [ZONE_NAMES[i] for i, z in enumerate(pred_zones_2s) if z == 1]
-                    z_str = ", ".join(active_names) if active_names else "none"
-                    summary = f"REALISTIC STABLE SCENE · {realistic_count} confirmed target(s) · 2s zones: [{z_str}]"
+                    active_names_3 = [THREE_ZONE_NAMES[i] for i, z in enumerate(pred_zones_3_2s) if z == 1]
+                    z_str = ", ".join(active_names_3) if active_names_3 else "none"
+                    summary = f"REALISTIC STABLE SCENE · {realistic_count} confirmed target(s) · 3-motor zones: [{z_str}]"
+
+            rec_3 = [
+                1 if (pred_zones_3_1s[i] == 1 or pred_zones_3_2s[i] == 1) else 0
+                for i in range(3)
+            ] if realistic_scene else [0, 0, 0]
+            rec_6 = [
+                1 if (pred_zones_1s[i] == 1 or pred_zones_2s[i] == 1) else 0
+                for i in range(6)
+            ] if realistic_scene else [0, 0, 0, 0, 0, 0]
 
             predict_ms = round((time.perf_counter() - t0) * 1000.0, 3)
             scenario = {
                 "realistic": realistic_scene,
+                "realistic_detection": realistic_scene,
                 "realism_score": realism_score,
                 "ego_motion_detected": ego_motion_detected,
                 "risk_level": risk_level,
+                "motion_trend": motion_trend,
                 "min_ttc_s": min_ttc_s,
                 "confirmed_tracks": realistic_count,
                 "filtered_anomalies": filtered_count,
+                "zones_3": curr_zones_3,
+                "predicted_zones_3_1s": pred_zones_3_1s,
+                "predicted_zones_3_2s": pred_zones_3_2s,
+                "predicted_zones_3_3s": pred_zones_3_3s,
+                "recommended_pre_alert_zones_3": rec_3,
+                "recommended_pre_alert_zones": rec_6,
                 "predicted_zones_1s": pred_zones_1s,
                 "predicted_zones_2s": pred_zones_2s,
                 "predicted_zones_3s": pred_zones_3s,
+                "keyframes_3s": keyframes_3s,
+                "predicted_next_3s": summary,
                 "summary": summary,
                 "predict_ms": predict_ms,
             }
             return enriched_objects, scenario
 
+    def _extract_3_keyframes(self, now):
+        """Sample the closest keyframes for t-2.0s, t-1.0s, and t0 from the rolling buffer."""
+        if not self._keyframes:
+            return []
+        targets = [("t-2s", now - 2.0), ("t-1s", now - 1.0), ("t0", now)]
+        out = []
+        for label, target_ts in targets:
+            closest = min(self._keyframes, key=lambda item: abs(item["ts"] - target_ts))
+            out.append({
+                "slot": label,
+                "dt_s": round(closest["ts"] - now, 2),
+                "ego_motion": closest["ego_motion"],
+                "zones_3": list(closest["zones_3"]),
+                "tracks": list(closest["tracks"]),
+            })
+        return out
 
-class AsyncVLMForecaster:
-    """Optional non-blocking background thread that queries local Ollama on GX10
-    to semantically verify whether the 3-second scenario is realistic.
-    Never blocks the fast YOLO26n + RIFE + Kalman loop.
+
+class DecisionForecaster:
+    """Asynchronous System-1 Decision Layer for 3-Second Hazard & 3-Motor Haptic Arbitration.
+
+    Supports:
+    - `laya`: Local open-source `convaiinnovations/laya` decision model (Apache 2.0, ~421M ModernBERT
+      with bidirectional option-order de-biasing, ~50–100 ms on MPS/CUDA, 100% offline).
+    - `jev`: Hosted TypeSafe AI `POST https://api.typesafe.ai/v1/systemone` endpoint using the key in
+      `private/jev_api_key.txt` or `JEV_API_KEY` environment variable.
+    - `kinematic`: Zero-weight deterministic fallback.
+
+    Runs in a non-blocking background thread in live mode so it never blocks YOLO26n.
     """
 
-    PROMPT = (
-        "You are a wearable obstacle-anticipation verifier. Given the camera frame and tracked kinematic "
-        "velocities, return JSON only: "
-        '{"realistic": true/false, "hazard_3s": "<short 10-word 3-second prediction>"}'
-    )
+    LAYA_MODEL_ID = "convaiinnovations/laya"
+    LAYA_REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"
+    JEV_API_URL = "https://api.typesafe.ai/v1/systemone"
+    JEV_MODEL = "jev-latest"
 
-    def __init__(self, ollama_url="http://127.0.0.1:11434", model="nemotron3:33b", interval_s=2.5, timeout_s=4.0):
-        self.ollama_url = ollama_url.rstrip("/")
-        self.model = model
+    INSTRUCTIONS = (
+        "Select the matching obstacle state and 3-motor haptic zone alert from the 3-second camera observation."
+    )
+    CRITERIA = {
+        "approaching_center": "Approaching collision risk in center corridor; vibrate Center motor.",
+        "crossing_left_to_center": "Walking from Left side toward Center corridor; vibrate Left and Center motors.",
+        "crossing_right_to_center": "Walking from Right side toward Center corridor; vibrate Center and Right motors.",
+        "left_obstacle": "Stationary obstacle confined to Left side only; vibrate Left motor only.",
+        "right_obstacle": "Stationary obstacle confined to Right side only; vibrate Right motor only.",
+        "unrealistic_or_clear": "No obstacle, empty clear room, or false head-turn sensor glitch; do not vibrate.",
+    }
+
+    TREND_TO_3ZONES = {
+        "approaching_center": [0, 1, 0],
+        "crossing_left_to_center": [1, 1, 0],
+        "crossing_right_to_center": [0, 1, 1],
+        "left_obstacle": [1, 0, 0],
+        "right_obstacle": [0, 0, 1],
+        "unrealistic_or_clear": [0, 0, 0],
+    }
+
+    ZONES3_TO_TREND = {
+        (0, 1, 0): "approaching_center",
+        (1, 1, 0): "crossing_left_to_center",
+        (0, 1, 1): "crossing_right_to_center",
+        (1, 0, 0): "left_obstacle",
+        (0, 0, 1): "right_obstacle",
+        (0, 0, 0): "unrealistic_or_clear",
+        (1, 1, 1): "approaching_center",
+        (1, 0, 1): "approaching_center",
+    }
+
+    MOTOR_QUESTIONS = {
+        "left_motor": {
+            "type": "noul",
+            "instructions": "Should the Left haptic motor vibrate (obstacle on Left side or walking from Left toward Center)?",
+        },
+        "center_motor": {
+            "type": "noul",
+            "instructions": "Should the Center haptic motor vibrate (obstacle in Center corridor or walking toward Center)?",
+        },
+        "right_motor": {
+            "type": "noul",
+            "instructions": "Should the Right haptic motor vibrate (obstacle on Right side or walking from Right toward Center)?",
+        },
+    }
+
+    TREND_TO_HAPTIC_PATTERN = {
+        "approaching_center": "urgent_center_pulse",
+        "crossing_left_to_center": "left_to_center_sweep",
+        "crossing_right_to_center": "right_to_center_sweep",
+        "left_obstacle": "steady_left_nudge",
+        "right_obstacle": "steady_right_nudge",
+        "unrealistic_or_clear": "silent",
+    }
+
+    def __init__(self, backend="auto", device="auto", jev_key_file="private/jev_api_key.txt",
+                 jev_url=None, jev_model=None, interval_s=0.35, timeout_s=2.5):
+        self.requested_backend = backend
+        self.device = device
+        self.jev_key_file = Path(jev_key_file) if jev_key_file else None
+        self.jev_url = (jev_url or os.environ.get("JEV_API_URL") or self.JEV_API_URL).rstrip("/")
+        self.jev_model = (jev_model or os.environ.get("JEV_MODEL") or self.JEV_MODEL).strip()
         self.interval_s = float(interval_s)
         self.timeout_s = float(timeout_s)
         self._lock = threading.Lock()
-        self._latest_Input = None
-        self._latest_forecast = None
+        self._infer_lock = threading.Lock()
+        self._laya_agent = None
+        self._laya_error = None
+        self._latest_input = None
+        self._latest_decision = None
         self._stop = threading.Event()
         self._thread = None
+
+    def _read_jev_key(self):
+        env_key = (os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY") or "").strip()
+        if env_key:
+            return env_key
+        if self.jev_key_file and self.jev_key_file.is_file():
+            try:
+                val = self.jev_key_file.read_text(encoding="utf-8").strip()
+                if val and not val.startswith("#"):
+                    return val.splitlines()[0].strip()
+            except OSError:
+                pass
+        return None
+
+    def set_backend(self, backend):
+        if backend not in ("auto", "laya", "jev", "kinematic"):
+            raise ValueError("Decision backend must be auto, laya, jev, or kinematic")
+        with self._lock:
+            self.requested_backend = backend
+
+    def _ensure_laya(self):
+        if self._laya_agent is not None:
+            return self._laya_agent
+        if self._laya_error is not None:
+            return None
+        try:
+            os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+            os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+            import laya
+            dev = self.device
+            if dev in ("auto", None, "", "0"):
+                if _ensure_torch():
+                    if torch.cuda.is_available():
+                        dev = "cuda:0"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        dev = "mps"
+                    else:
+                        dev = "cpu"
+                else:
+                    dev = "cpu"
+            try:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                self._laya_agent = laya.load(
+                    self.LAYA_MODEL_ID,
+                    revision=self.LAYA_REVISION,
+                    device=dev,
+                    backend="eager",
+                )
+            except Exception:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                self._laya_agent = laya.load(
+                    self.LAYA_MODEL_ID,
+                    revision=self.LAYA_REVISION,
+                    device=dev,
+                    backend="eager",
+                )
+            return self._laya_agent
+        except Exception as exc:
+            self._laya_error = str(exc)
+            return None
+
+    @staticmethod
+    def build_keyframe_state_text(scenario):
+        """Format the 3 keyframes (t-2s, t-1s, t0) and YOLO velocities into a concise state string for Laya / Jev."""
+        keyframes = scenario.get("keyframes_3s") or []
+        ego = scenario.get("ego_motion_detected", False)
+        confirmed = scenario.get("confirmed_tracks", 0)
+        filtered = scenario.get("filtered_anomalies", 0)
+        ttc = scenario.get("min_ttc_s")
+
+        if confirmed == 0 and filtered > 0 or ego:
+            return (
+                "t=-2s: Empty room. "
+                "t=-1s: Fast camera head-turn glitch. "
+                "t=0s: All motors OFF, silent, zero obstacles."
+            )
+        if confirmed == 0:
+            return (
+                "t=-2s: Empty room. "
+                "t=-1s: Empty room. "
+                "t=0s: All motors OFF, silent, zero obstacles."
+            )
+
+        start_z3 = None
+        for kf in keyframes:
+            trks_kf = [t for t in (kf.get("tracks") or []) if t.get("realistic", True)]
+            if trks_kf:
+                start_z3 = trks_kf[0].get("zone_3", "CENTER").capitalize()
+                break
+
+        parts = []
+        for kf in keyframes:
+            slot = kf.get("slot", "t0")
+            trks = [t for t in (kf.get("tracks") or []) if t.get("realistic", True)]
+            if not trks:
+                parts.append(f"{slot}: Clear")
+                continue
+            t = trks[0]
+            cls_name = str(t.get("class", "person")).capitalize()
+            z3 = t.get("zone_3", "CENTER").capitalize()
+            p3 = t.get("pred_zone_3", z3).capitalize()
+            vx = float(t.get("vx", 0.0))
+            spd = t.get("speed_mps")
+            spd_str = f" at {spd:.1f} m/s" if spd is not None else ""
+            if slot == "t0":
+                if (z3 == "Left" and (p3 == "Center" or vx > 25.0)) or (start_z3 == "Left" and z3 == "Center" and vx > 25.0):
+                    parts.append(
+                        f"t=0s: Confirmed {cls_name} walking from Left side toward Center corridor; vibrate Left and Center motors."
+                    )
+                elif (z3 == "Right" and (p3 == "Center" or vx < -25.0)) or (start_z3 == "Right" and z3 == "Center" and vx < -25.0):
+                    parts.append(
+                        f"t=0s: Confirmed {cls_name} walking from Right side toward Center corridor; vibrate Center and Right motors."
+                    )
+                elif t.get("approaching") and (p3 == "Center" or z3 == "Center"):
+                    ttc_str = f" (TTC {ttc:.1f}s)" if ttc is not None else ""
+                    parts.append(
+                        f"t=0s: Confirmed {cls_name} approaching collision risk in Center corridor{ttc_str}; vibrate Center motor."
+                    )
+                else:
+                    parts.append(
+                        f"t=0s: Stationary {cls_name} confined to {z3} side only; vibrate {z3} motor only."
+                    )
+            else:
+                if z3 != p3 or (slot == "t-1s" and start_z3 in ("Left", "Right") and z3 == "Center"):
+                    origin = start_z3 if (start_z3 in ("Left", "Right") and z3 == "Center") else z3
+                    parts.append(f"{slot}: {cls_name} walking from {origin} side toward Center{spd_str}.")
+                elif t.get("approaching"):
+                    parts.append(f"{slot}: {cls_name} in {z3} approaching fast{spd_str}.")
+                else:
+                    parts.append(f"{slot}: Stationary {cls_name} confined to {z3} side only.")
+        return " ".join(parts)
+
+    def _run_laya(self, state_text):
+        agent = self._ensure_laya()
+        if agent is None:
+            return None
+        with self._infer_lock:
+            res = agent.system_one(state_text, self.MOTOR_QUESTIONS, max_len=224, head_max_len=96)["answers"]
+        p_l = float(res["left_motor"]["noul"])
+        p_c = float(res["center_motor"]["noul"])
+        p_r = float(res["right_motor"]["noul"])
+        motor_probs = [round(p_l, 3), round(p_c, 3), round(p_r, 3)]
+        z3 = (int(p_l >= 0.5), int(p_c >= 0.5), int(p_r >= 0.5))
+        choice = self.ZONES3_TO_TREND.get(z3, "approaching_center")
+        conf_bits = [
+            p_l if z3[0] else (1.0 - p_l),
+            p_c if z3[1] else (1.0 - p_c),
+            p_r if z3[2] else (1.0 - p_r),
+        ]
+        conf = sum(conf_bits) / 3.0
+        probs = {
+            k: round(
+                (
+                    (p_l if v[0] else (1.0 - p_l))
+                    * (p_c if v[1] else (1.0 - p_c))
+                    * (p_r if v[2] else (1.0 - p_r))
+                ),
+                4,
+            )
+            for k, v in self.TREND_TO_3ZONES.items()
+        }
+        return {
+            "backend": "laya",
+            "model": self.LAYA_MODEL_ID,
+            "choice": choice,
+            "confidence": round(conf, 3),
+            "probabilities": probs,
+            "motor_probabilities_3": motor_probs,
+            "jev_key_configured": bool(self._read_jev_key()),
+        }
+
+    def _run_jev(self, state_text):
+        api_key = self._read_jev_key()
+        if not api_key:
+            return None
+        questions = {
+            "hazard_decision": {
+                "type": "choice",
+                "instructions": self.INSTRUCTIONS,
+                "criteria": self.CRITERIA,
+            },
+            **self.MOTOR_QUESTIONS,
+        }
+        payload = {
+            "model": self.jev_model,
+            "state": state_text,
+            "questions": questions,
+        }
+        req = urllib.request.Request(
+            self.jev_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "RAGging-Canes/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            body = json.load(resp)
+        answers = body.get("answers") or {}
+        ans = answers.get("hazard_decision") or {}
+        probs = ans.get("probabilities") or {}
+        choice = ans.get("choice") or (max(probs, key=probs.get) if probs else "approaching_center")
+        conf = float(ans.get("answer_confidence", ans.get("confidence", probs.get(choice, 0.85))))
+        default_z3 = self.TREND_TO_3ZONES.get(choice, [0, 0, 0])
+        motor_probs = [
+            round(float((answers.get("left_motor") or {}).get("noul", default_z3[0])), 3),
+            round(float((answers.get("center_motor") or {}).get("noul", default_z3[1])), 3),
+            round(float((answers.get("right_motor") or {}).get("noul", default_z3[2])), 3),
+        ]
+        return {
+            "backend": "jev",
+            "model": body.get("model", self.jev_model),
+            "choice": choice,
+            "confidence": round(conf, 3),
+            "probabilities": probs,
+            "motor_probabilities_3": motor_probs,
+            "usage": body.get("usage", {}),
+            "jev_key_configured": True,
+        }
+
+    def evaluate_sync(self, scenario):
+        """Evaluate the 3-keyframe scenario synchronously and return the structured decision JSON."""
+        t0 = time.perf_counter()
+        state_text = self.build_keyframe_state_text(scenario)
+        with self._lock:
+            req_backend = self.requested_backend
+
+        raw_decision = None
+        fallback_note = None
+        if req_backend == "jev":
+            try:
+                raw_decision = self._run_jev(state_text)
+                if raw_decision is None:
+                    fallback_note = "Paste Jev key into private/jev_api_key.txt (using Laya fallback)"
+            except Exception as exc:
+                fallback_note = f"Jev API unreachable ({type(exc).__name__}), using Laya fallback"
+            if raw_decision is None:
+                raw_decision = self._run_laya(state_text)
+        elif req_backend in ("laya", "auto"):
+            raw_decision = self._run_laya(state_text)
+            if raw_decision is None and req_backend == "auto":
+                try:
+                    raw_decision = self._run_jev(state_text)
+                except Exception:
+                    pass
+
+        confirmed = int(scenario.get("confirmed_tracks", 0))
+        kin_realistic = bool(scenario.get("realistic", True))
+        kin_trend = scenario.get("motion_trend", "approaching_center")
+        ttc = scenario.get("min_ttc_s")
+
+        if raw_decision is None:
+            choice = kin_trend if (kin_realistic and confirmed > 0) else "unrealistic_or_clear"
+            raw_decision = {
+                "backend": "kinematic",
+                "model": "kalman-3zone-rules",
+                "choice": choice,
+                "confidence": float(scenario.get("realism_score", 0.9)),
+                "probabilities": {choice: 1.0},
+                "motor_probabilities_3": [float(v) for v in self.TREND_TO_3ZONES.get(choice, [0, 0, 0])],
+                "jev_key_configured": bool(self._read_jev_key()),
+            }
+
+        choice = raw_decision["choice"]
+        realistic_detection = bool(choice != "unrealistic_or_clear" and kin_realistic)
+        zones_3 = list(self.TREND_TO_3ZONES.get(choice, [0, 0, 0]))
+        if realistic_detection and confirmed > 0 and sum(zones_3) == 0:
+            zones_3 = list(scenario.get("recommended_pre_alert_zones_3") or [0, 1, 0])
+        elif not realistic_detection or confirmed == 0:
+            zones_3 = [0, 0, 0]
+
+        zones_6 = three_to_six_zones(zones_3)
+        haptic_pattern = self.TREND_TO_HAPTIC_PATTERN.get(choice, "silent") if realistic_detection else "silent"
+
+        if not realistic_detection:
+            predicted_next_3s = "Unrealistic motion / head-turn filtered; all 3 haptic motors suppressed [0, 0, 0]."
+        elif confirmed == 0:
+            predicted_next_3s = "Forward corridor clear over next 3.0s; 3 haptic motors idle [0, 0, 0]."
+        elif choice == "approaching_center":
+            ttc_str = f"~{ttc:.1f}s" if ttc is not None else "~2.0s"
+            predicted_next_3s = f"Target approaching center corridor; collision risk in {ttc_str} → vibrate CENTER [0, 1, 0]"
+        elif choice == "crossing_left_to_center":
+            ttc_str = f"~{ttc:.1f}s" if ttc is not None else "~2.2s"
+            predicted_next_3s = f"Target on Left walking toward Center ({ttc_str}) → pre-alert LEFT+CENTER [1, 1, 0]"
+        elif choice == "crossing_right_to_center":
+            ttc_str = f"~{ttc:.1f}s" if ttc is not None else "~2.2s"
+            predicted_next_3s = f"Target on Right walking toward Center ({ttc_str}) → pre-alert CENTER+RIGHT [0, 1, 1]"
+        elif choice == "left_obstacle":
+            predicted_next_3s = "Confirmed obstacle on Left side → pre-alert LEFT motor [1, 0, 0]"
+        else:
+            predicted_next_3s = "Confirmed obstacle on Right side → pre-alert RIGHT motor [0, 0, 1]"
+
+        decision_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        result = {
+            "realistic_detection": realistic_detection,
+            "motion_trend": choice,
+            "predicted_next_3s": predicted_next_3s,
+            "recommended_pre_alert_zones_3": zones_3,
+            "recommended_pre_alert_zones": zones_6,
+            "motor_probabilities_3": raw_decision.get("motor_probabilities_3", [float(v) for v in zones_3]),
+            "haptic_pattern": haptic_pattern,
+            "confidence": raw_decision["confidence"],
+            "probabilities": raw_decision["probabilities"],
+            "backend": raw_decision["backend"],
+            "requested_backend": req_backend,
+            "model": raw_decision["model"],
+            "jev_key_configured": raw_decision["jev_key_configured"],
+            "fallback_note": fallback_note,
+            "state_prompt": state_text,
+            "decision_ms": decision_ms,
+            "updated_at": time.monotonic(),
+        }
+        with self._lock:
+            self._latest_decision = dict(result)
+        return result
 
     def start(self):
         if self._thread is None:
@@ -829,52 +1342,29 @@ class AsyncVLMForecaster:
         if self._thread:
             self._thread.join(timeout=0.5)
 
-    def submit(self, jpeg_bytes, kinematic_scenario):
+    def submit(self, kinematic_scenario, jpeg_bytes=None):
         with self._lock:
-            self._latest_Input = (jpeg_bytes, dict(kinematic_scenario), time.monotonic())
+            self._latest_input = dict(kinematic_scenario)
 
     def latest(self):
         with self._lock:
-            return dict(self._latest_forecast) if self._latest_forecast else None
+            return dict(self._latest_decision) if self._latest_decision else None
 
     def _loop(self):
         while not self._stop.is_set():
             with self._lock:
-                item = self._latest_Input
-                self._latest_Input = None
-            if item is None:
-                self._stop.wait(0.2)
+                scenario = self._latest_input
+                self._latest_input = None
+            if scenario is None:
+                self._stop.wait(0.08)
                 continue
-            jpeg_bytes, scenario, ts = item
             try:
-                t0 = time.monotonic()
-                payload = {
-                    "model": self.model,
-                    "messages": [{
-                        "role": "user",
-                        "content": f"{self.PROMPT}\nKinematic summary: {scenario.get('summary', '')}",
-                        "images": [base64.b64encode(jpeg_bytes).decode("ascii")],
-                    }],
-                    "think": False,
-                    "stream": False,
-                    "options": {"temperature": 0, "num_predict": 48},
-                }
-                req = urllib.request.Request(
-                    f"{self.ollama_url}/api/chat",
-                    data=json.dumps(payload).encode(),
-                    headers={"Content-Type": "application/json"},
-                )
-                with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                    body = json.load(resp)
-                content = body.get("message", {}).get("content", "{}")
-                parsed = json.loads(content)
-                with self._lock:
-                    self._latest_forecast = {
-                        "realistic": bool(parsed.get("realistic", True)),
-                        "hazard_3s": str(parsed.get("hazard_3s", ""))[:120],
-                        "vlm_ms": round((time.monotonic() - t0) * 1000),
-                        "updated_at": time.monotonic(),
-                    }
+                self.evaluate_sync(scenario)
             except Exception:
                 pass
             self._stop.wait(self.interval_s)
+
+
+# Keep alias for backwards compatibility
+AsyncVLMForecaster = DecisionForecaster
+

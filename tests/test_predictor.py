@@ -90,7 +90,7 @@ class PredictorAndRIFETests(unittest.TestCase):
         self.assertEqual(res_jump[0]["realism_reason"], "unrealistic_velocity_jump")
         self.assertFalse(scen_jump["realistic"])
 
-    def test_dashboard_state_exposes_scenario_and_rife_controls(self):
+    def test_dashboard_state_exposes_scenario_3zones_and_controls(self):
         import time
         with tempfile.TemporaryDirectory() as tmp:
             state = State("live", Path(tmp), rife_factor=2, device="cpu")
@@ -106,12 +106,105 @@ class PredictorAndRIFETests(unittest.TestCase):
             snap = state.snapshot()
             self.assertIn("scenario", snap)
             self.assertTrue(snap["scenario"]["realistic"])
+            self.assertEqual(snap["zones_3"], [0, 1, 0])
+            self.assertEqual(len(snap["predicted_zones_3_2s"]), 3)
             self.assertEqual(snap["rife"]["interpolated_count"], 2)
             state.set_rife(0)
             self.assertEqual(state.interpolator.factor, 0)
+            state.set_decision_backend("kinematic")
+            self.assertEqual(state.decision_forecaster.requested_backend, "kinematic")
+            state.decision_forecaster.stop()
             with self.assertRaises(ValueError):
                 state.set_rife(99)
+            with self.assertRaises(ValueError):
+                state.set_decision_backend("invalid_model")
+
+    def test_decision_forecaster_laya_and_jev_api_key_file(self):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from software.predictor import DecisionForecaster, six_to_three_zones, three_to_six_zones
+
+        self.assertEqual(six_to_three_zones([0, 0, 1, 1, 0, 0]), [0, 1, 0])
+        self.assertEqual(six_to_three_zones([1, 0, 0, 0, 0, 1]), [1, 0, 1])
+        self.assertEqual(three_to_six_zones([0, 1, 0]), [0, 0, 1, 1, 0, 0])
+
+        pred = TrajectoryPredictor()
+        pred.update([{"class": "person", "confidence": 0.93, "xyxy": [200, 120, 280, 340]}], 640, 480, timestamp=1.0)
+        _, scen = pred.update([{"class": "person", "confidence": 0.95, "xyxy": [260, 110, 360, 390]}], 640, 480, timestamp=1.5)
+
+        # 1. Test local Laya (or kinematic fallback if laya is not installed in current runner)
+        forecaster_laya = DecisionForecaster(backend="laya")
+        dec_laya = forecaster_laya.evaluate_sync(scen)
+        self.assertIn(dec_laya["backend"], ("laya", "kinematic"))
+        self.assertTrue(dec_laya["realistic_detection"])
+        self.assertEqual(len(dec_laya["recommended_pre_alert_zones_3"]), 3)
+        self.assertEqual(len(dec_laya["recommended_pre_alert_zones"]), 6)
+
+        # 2. Test Jev API reading private key file and calling /v1/systemone
+        received_headers = {}
+        received_body = {}
+
+        class MockJevHandler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                received_headers["auth"] = self.headers.get("Authorization")
+                length = int(self.headers.get("Content-Length", "0"))
+                received_body.update(json.loads(self.rfile.read(length)))
+                resp = {
+                    "model": "jev-latest",
+                    "answers": {
+                        "hazard_decision": {
+                            "type": "choice",
+                            "choice": "approaching_center",
+                            "confidence": 0.96,
+                            "probabilities": {
+                                "approaching_center": 0.96,
+                                "crossing_left_to_center": 0.02,
+                                "crossing_right_to_center": 0.01,
+                                "left_obstacle": 0.005,
+                                "right_obstacle": 0.003,
+                                "unrealistic_or_clear": 0.002,
+                            },
+                        }
+                    },
+                    "usage": {"input_tokens": 90, "output_tokens": 0},
+                }
+                raw = json.dumps(resp).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MockJevHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                key_path = Path(tmp) / "jev_api_key.txt"
+                key_path.write_text("jev-test-secret-key-123\n", encoding="utf-8")
+                forecaster_jev = DecisionForecaster(
+                    backend="jev",
+                    jev_key_file=key_path,
+                    jev_url=f"http://127.0.0.1:{server.server_port}/v1/systemone",
+                )
+                dec_jev = forecaster_jev.evaluate_sync(scen)
+                self.assertEqual(received_headers.get("auth"), "Bearer jev-test-secret-key-123")
+                self.assertIn("hazard_decision", received_body.get("questions", {}))
+                self.assertEqual(dec_jev["backend"], "jev")
+                self.assertTrue(dec_jev["realistic_detection"])
+                self.assertEqual(dec_jev["motion_trend"], "approaching_center")
+                self.assertEqual(dec_jev["recommended_pre_alert_zones_3"], [0, 1, 0])
+                self.assertEqual(dec_jev["recommended_pre_alert_zones"], [0, 0, 1, 1, 0, 0])
+        finally:
+            server.shutdown()
+            server.server_close()
+            t.join(timeout=1)
 
 
 if __name__ == "__main__":
     unittest.main()
+

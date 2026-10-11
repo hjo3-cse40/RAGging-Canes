@@ -51,13 +51,66 @@ class FastStreamServer {
     return true;
   }
 
+  // Configure 3 directional vibration motor PWM pins [Left, Center, Right].
+  // Defaults match hardware wiring: LEFT=42, CENTER=21, RIGHT=47, 1000 Hz, 8-bit PWM (0..255).
+  bool configureMotors(int pinLeft = 42, int pinCenter = 21, int pinRight = 47,
+                       uint32_t pwmFreq = 1000, uint8_t pwmResolution = 8) {
+    motorPins_[0] = pinLeft;
+    motorPins_[1] = pinCenter;
+    motorPins_[2] = pinRight;
+    pwmFreq_ = pwmFreq;
+    pwmResolution_ = pwmResolution;
+    bool allOk = true;
+    for (int i = 0; i < 3; ++i) {
+      if (motorPins_[i] >= 0) {
+        if (ledcAttach(motorPins_[i], pwmFreq_, pwmResolution_)) {
+          ledcWrite(motorPins_[i], 0);
+          motorPwmAttached_[i] = true;
+        } else {
+          pinMode(motorPins_[i], OUTPUT);
+          digitalWrite(motorPins_[i], LOW);
+          motorPwmAttached_[i] = false;
+          allOk = false;
+        }
+      }
+    }
+    ensureSensorTask();
+    return allOk;
+  }
+
+  static int getPWM(int strength) {
+    return map(constrain(strength, 0, 100), 0, 100, 0, 255);
+  }
+
+  // Optional: configure HC-SR04 / ultrasonic proximity sensor pins and local center-motor reflex.
+  void configureUltrasonic(int trigPin, int echoPin, float reflexThresholdCm = 60.0f) {
+    ultraTrigPin_ = trigPin;
+    ultraEchoPin_ = echoPin;
+    ultraReflexCm_ = reflexThresholdCm;
+    if (ultraTrigPin_ >= 0 && ultraEchoPin_ >= 0) {
+      pinMode(ultraTrigPin_, OUTPUT);
+      digitalWrite(ultraTrigPin_, LOW);
+      pinMode(ultraEchoPin_, INPUT);
+    }
+    ensureSensorTask();
+  }
+
+  // Read latest ultrasonic distance in cm (-1.0f if unavailable).
+  float readUltrasonicCm() const { return lastUltrasonicCm_; }
+
+  // Read current applied motor strengths [Left, Center, Right] (0..100).
+  void readMotorStrengths(int outStrengths[3]) const {
+    for (int i = 0; i < 3; ++i) outStrengths[i] = appliedStrengths_[i];
+  }
+
   bool begin(framesize_t initialFrameSize = FRAMESIZE_QVGA, int initialQuality = 14) {
     optimizeLiveSensor(initialFrameSize, initialQuality);
+    ensureSensorTask();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port_;
     config.ctrl_port = 32768 + (port_ % 1000);
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
     config.max_open_sockets = 5;
     config.lru_purge_enable = true;
 
@@ -68,14 +121,16 @@ class FastStreamServer {
     const httpd_uri_t captureUri = {"/capture", HTTP_GET, handleCapture, this};
     const httpd_uri_t controlUri = {"/control", HTTP_GET, handleControl, this};
     const httpd_uri_t statusUri = {"/status", HTTP_GET, handleStatus, this};
+    const httpd_uri_t hapticsUri = {"/haptics", HTTP_GET, handleHaptics, this};
     const httpd_uri_t streamUri = {"/stream", HTTP_GET, handleStream, this};
     const httpd_uri_t wsUri = {"/ws", HTTP_GET, handleWebSocket, this};
 
     httpd_register_uri_handler(cmdServer_, &captureUri);
     httpd_register_uri_handler(cmdServer_, &controlUri);
     httpd_register_uri_handler(cmdServer_, &statusUri);
-    // Expose /stream and /ws on the primary port (e.g. port 80) so single-port
-    // SSH reverse tunnels (-R 8117:ESP32_IP:80) can stream without opening port 81.
+    httpd_register_uri_handler(cmdServer_, &hapticsUri);
+    // Expose /stream, /ws, and /haptics on the primary port (e.g. port 80) so single-port
+    // SSH reverse tunnels (-R 8117:ESP32_IP:80) carry video, ultrasonic, and haptics together.
     httpd_register_uri_handler(cmdServer_, &streamUri);
     httpd_register_uri_handler(cmdServer_, &wsUri);
 
@@ -318,22 +373,163 @@ class FastStreamServer {
 
   static esp_err_t handleStatus(httpd_req_t* req) {
     enableTcpNoDelay(req);
+    auto* self = static_cast<FastStreamServer*>(req->user_ctx);
     sensor_t* s = esp_camera_sensor_get();
     if (!s) {
       httpd_resp_send_500(req);
       return ESP_FAIL;
     }
-    char json[192];
+    const float ultraCm = self ? self->lastUltrasonicCm_ : -1.0f;
+    const int m0 = self ? self->appliedStrengths_[0] : 0;
+    const int m1 = self ? self->appliedStrengths_[1] : 0;
+    const int m2 = self ? self->appliedStrengths_[2] : 0;
+    const bool reflex = self ? self->reflexActive_ : false;
+    char json[320];
     snprintf(json, sizeof(json),
-             "{\"framesize\":%d,\"quality\":%d,\"vflip\":%d,\"hmirror\":%d,\"stream_path\":\"/stream\",\"ws_path\":\"/ws\"}",
-             s->status.framesize, s->status.quality, s->status.vflip, s->status.hmirror);
+             "{\"framesize\":%d,\"quality\":%d,\"vflip\":%d,\"hmirror\":%d,"
+             "\"stream_path\":\"/stream\",\"ws_path\":\"/ws\",\"haptics_path\":\"/haptics\","
+             "\"ultrasonic_cm\":%.1f,\"reflex_active\":%s,\"motor_strength_3\":[%d,%d,%d]}",
+             s->status.framesize, s->status.quality, s->status.vflip, s->status.hmirror,
+             ultraCm, reflex ? "true" : "false", m0, m1, m2);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+  }
+
+  // Bi-directional Haptics + Ultrasonic endpoint:
+  // GET /haptics?l=80&c=0&r=0&ttl=1200  (or GET /haptics to read status/ultrasonic)
+  static esp_err_t handleHaptics(httpd_req_t* req) {
+    enableTcpNoDelay(req);
+    auto* self = static_cast<FastStreamServer*>(req->user_ctx);
+    if (!self) {
+      httpd_resp_send_500(req);
+      return ESP_FAIL;
+    }
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+      char valBuf[16];
+      int next[3] = {self->remoteStrengths_[0], self->remoteStrengths_[1], self->remoteStrengths_[2]};
+      bool updated = false;
+      const char* keys[3] = {"l", "c", "r"};
+      for (int i = 0; i < 3; ++i) {
+        if (httpd_query_key_value(query, keys[i], valBuf, sizeof(valBuf)) == ESP_OK) {
+          int v = constrain(atoi(valBuf), 0, 100);
+          next[i] = v;
+          updated = true;
+        }
+      }
+      uint32_t ttlMs = 1200;
+      if (httpd_query_key_value(query, "ttl", valBuf, sizeof(valBuf)) == ESP_OK) {
+        int parsedTtl = atoi(valBuf);
+        if (parsedTtl >= 0 && parsedTtl <= 2500) {
+          ttlMs = static_cast<uint32_t>(parsedTtl);
+        }
+      }
+      if (updated) {
+        const bool changed = (next[0] != self->remoteStrengths_[0] ||
+                              next[1] != self->remoteStrengths_[1] ||
+                              next[2] != self->remoteStrengths_[2]);
+        for (int i = 0; i < 3; ++i) self->remoteStrengths_[i] = next[i];
+        self->hapticsDeadlineMs_ = (ttlMs > 0 && (next[0] > 0 || next[1] > 0 || next[2] > 0))
+                                       ? (millis() + ttlMs)
+                                       : 0;
+        self->applyMotorsNow();
+        if (changed) {
+          Serial.printf("Haptics [L,C,R]: [%d%%,%d%%,%d%%] PWM=[%d,%d,%d] ttl=%ums ultra=%.1fcm\n",
+                        next[0], next[1], next[2],
+                        getPWM(next[0]), getPWM(next[1]), getPWM(next[2]),
+                        ttlMs, self->lastUltrasonicCm_);
+        }
+      }
+    }
+    const uint32_t now = millis();
+    const int32_t remTtl = self->hapticsDeadlineMs_ > 0
+                               ? static_cast<int32_t>(self->hapticsDeadlineMs_ - now)
+                               : 0;
+    char json[256];
+    snprintf(json, sizeof(json),
+             "{\"ok\":true,\"motor_strength_3\":[%d,%d,%d],"
+             "\"ultrasonic_cm\":%.1f,\"reflex_active\":%s,\"ttl_ms\":%d}",
+             self->appliedStrengths_[0], self->appliedStrengths_[1], self->appliedStrengths_[2],
+             self->lastUltrasonicCm_, self->reflexActive_ ? "true" : "false",
+             remTtl > 0 ? static_cast<int>(remTtl) : 0);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+  }
+
+  void ensureSensorTask() {
+    if (sensorTaskHandle_ != nullptr) return;
+    xTaskCreatePinnedToCore(sensorTaskEntry, "FastSensorHaptics", 3072, this, 1, &sensorTaskHandle_, 0);
+  }
+
+  static void sensorTaskEntry(void* arg) {
+    auto* self = static_cast<FastStreamServer*>(arg);
+    uint32_t lastUltraMs = 0;
+    for (;;) {
+      const uint32_t now = millis();
+      if (self->ultraTrigPin_ >= 0 && self->ultraEchoPin_ >= 0 && (now - lastUltraMs >= 60)) {
+        lastUltraMs = now;
+        digitalWrite(self->ultraTrigPin_, LOW);
+        delayMicroseconds(2);
+        digitalWrite(self->ultraTrigPin_, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(self->ultraTrigPin_, LOW);
+        const long durationUs = pulseIn(self->ultraEchoPin_, HIGH, 15000);
+        if (durationUs > 0) {
+          self->lastUltrasonicCm_ = (durationUs * 0.0343f) / 2.0f;
+        } else {
+          self->lastUltrasonicCm_ = -1.0f;
+        }
+      }
+      self->applyMotorsNow();
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
+
+  void applyMotorsNow() {
+    const uint32_t now = millis();
+    const bool remoteFresh = (hapticsDeadlineMs_ > 0 && static_cast<int32_t>(hapticsDeadlineMs_ - now) > 0);
+    if (!remoteFresh) {
+      remoteStrengths_[0] = 0;
+      remoteStrengths_[1] = 0;
+      remoteStrengths_[2] = 0;
+    }
+    const float d = lastUltrasonicCm_;
+    reflexActive_ = (d > 2.0f && d <= ultraReflexCm_);
+    int target[3] = {
+      remoteStrengths_[0],
+      reflexActive_ ? max(35, remoteStrengths_[1]) : remoteStrengths_[1],
+      remoteStrengths_[2]
+    };
+    for (int i = 0; i < 3; ++i) {
+      appliedStrengths_[i] = target[i];
+      if (motorPins_[i] >= 0) {
+        if (motorPwmAttached_[i]) {
+          ledcWrite(motorPins_[i], getPWM(target[i]));
+        } else {
+          digitalWrite(motorPins_[i], target[i] > 0 ? HIGH : LOW);
+        }
+      }
+    }
   }
 
   uint16_t port_;
   uint16_t streamPort_;
   httpd_handle_t cmdServer_ = nullptr;
   httpd_handle_t streamServer_ = nullptr;
+  TaskHandle_t sensorTaskHandle_ = nullptr;
+  int motorPins_[3] = {-1, -1, -1};
+  bool motorPwmAttached_[3] = {false, false, false};
+  uint32_t pwmFreq_ = 1000;
+  uint8_t pwmResolution_ = 8;
+  int remoteStrengths_[3] = {0, 0, 0};
+  int appliedStrengths_[3] = {0, 0, 0};
+  uint32_t hapticsDeadlineMs_ = 0;
+  int ultraTrigPin_ = -1;
+  int ultraEchoPin_ = -1;
+  float ultraReflexCm_ = 60.0f;
+  float lastUltrasonicCm_ = -1.0f;
+  bool reflexActive_ = false;
 };

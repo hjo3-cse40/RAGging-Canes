@@ -1138,13 +1138,28 @@ function render() {
       const distance = haptic?.distance_m_3?.[i];
       const score = Number.isFinite(confidence) ? `${Math.round(confidence * 100)}% confidence` : 'Confidence unavailable';
       const depth = Number.isFinite(distance) ? `${distance.toFixed(2)} m` : 'No distance';
+      const modeTag = haptic?.override_active
+        ? `Manual PWM override (${Math.round(strength * 2.55)}/255)`
+        : (haptic?.preview_only || haptic?.source_mode !== 'live' ? 'Preview only' : 'Requested strength');
       return `<div class="zone ${!available ? 'unknown' : strength > 0 ? 'active' : ''}">
         <strong>${name}: ${available ? `${strength}%` : 'UNAVAILABLE'}</strong>
         <progress max="100" value="${strength}" aria-label="${name} requested motor strength"></progress>
         <small>${score} · ${depth}</small>
-        <small>${haptic?.preview_only || haptic?.source_mode !== 'live' ? 'Preview only' : 'Requested strength'}</small>
+        <small>${modeTag}</small>
       </div>`;
     }).join('');
+  }
+  if ($('esp32-sensor-badge')) {
+    const esp = s.esp32_sensor;
+    if (esp && esp.connected) {
+      const uText = esp.ultrasonic_cm != null ? `ULTRA ${esp.ultrasonic_cm.toFixed(1)} cm` : 'LINK ACTIVE';
+      const rText = esp.reflex_active ? ' · ⚠️ REFLEX ON' : '';
+      $('esp32-sensor-badge').textContent = `ESP32: ${uText}${rText}`;
+    } else if (haptic?.override_active) {
+      $('esp32-sensor-badge').textContent = `OVERRIDE ACTIVE: [${haptic.motor_strength_3.join('%, ')}%]`;
+    } else {
+      $('esp32-sensor-badge').textContent = 'ESP32 SENSOR: STANDBY';
+    }
   }
 
   const activeBackend = s.decision_backend || dec?.requested_backend || dec?.backend || 'laya';
@@ -1488,6 +1503,80 @@ $('clear').onclick = async () => {
     message(e.message, true);
   }
 };
+
+let sweepTimers = [];
+function clearSweepTimers() {
+  for (const t of sweepTimers) clearTimeout(t);
+  sweepTimers = [];
+}
+
+function getTestStrength() {
+  const raw = Number($('haptic-test-strength')?.value ?? 35);
+  return Math.max(5, Math.min(100, Number.isFinite(raw) ? Math.round(raw) : 35));
+}
+
+async function triggerHapticTest(strengths, duration_s = 1.5, label = 'manual_test', stop = false) {
+  try {
+    const res = await post('/api/haptic_test', { strengths, duration_s, label, stop });
+    if (state && res.haptics) {
+      state.haptics = { ...res.haptics, preview_only: false };
+      receivedAt = performance.now();
+      render();
+    }
+    if (stop || !strengths || strengths.every(v => v === 0)) {
+      message('Haptic manual test stopped — returned to automatic obstacle haptics.');
+    } else {
+      const pwm = strengths.map(s => Math.round((s / 100) * 255));
+      message(`Triggered ESP32 3-Motor PWM [L:42, C:21, R:47] = [${strengths.join('%, ')}%] (duty [${pwm.join(', ')}]/255 for ${duration_s}s).`);
+    }
+  } catch (err) {
+    message(err.message, true);
+  }
+}
+
+if ($('btn-haptic-left')) {
+  $('btn-haptic-left').onclick = () => {
+    clearSweepTimers();
+    const s = getTestStrength();
+    triggerHapticTest([s, 0, 0], 1.5, 'left_test');
+  };
+}
+if ($('btn-haptic-center')) {
+  $('btn-haptic-center').onclick = () => {
+    clearSweepTimers();
+    const s = getTestStrength();
+    triggerHapticTest([0, s, 0], 1.5, 'center_test');
+  };
+}
+if ($('btn-haptic-right')) {
+  $('btn-haptic-right').onclick = () => {
+    clearSweepTimers();
+    const s = getTestStrength();
+    triggerHapticTest([0, 0, s], 1.5, 'right_test');
+  };
+}
+if ($('btn-haptic-all')) {
+  $('btn-haptic-all').onclick = () => {
+    clearSweepTimers();
+    const s = getTestStrength();
+    triggerHapticTest([s, s, s], 1.5, 'all_test');
+  };
+}
+if ($('btn-haptic-Sweep') || $('btn-haptic-sweep')) {
+  $('btn-haptic-sweep').onclick = () => {
+    clearSweepTimers();
+    const s = getTestStrength();
+    triggerHapticTest([s, 0, 0], 1.0, 'sweep_left');
+    sweepTimers.push(setTimeout(() => triggerHapticTest([0, s, 0], 1.0, 'sweep_center'), 950));
+    sweepTimers.push(setTimeout(() => triggerHapticTest([0, 0, s], 1.0, 'sweep_right'), 1900));
+  };
+}
+if ($('btn-haptic-stop')) {
+  $('btn-haptic-stop').onclick = () => {
+    clearSweepTimers();
+    triggerHapticTest([0, 0, 0], 0, 'stop', true);
+  };
+}
 
 // Start 60 FPS animation loop and poller
 requestAnimationFrame(animate);

@@ -130,6 +130,21 @@
           <span id="haptic-pattern-tag">LEFT · CENTER · RIGHT</span>
         </div>
         <div class="zones zones-3" id="zones-3"></div>
+        <div class="haptic-test-bar" id="haptic-test-bar" aria-label="ESP32 Haptic Hardware Test Controls">
+          <div class="haptic-test-controls">
+            <span class="control-label">ESP32 PWM Test:</span>
+            <label class="haptic-strength-label" title="Motor PWM strength percentage (0-100%, maps 0-255 @ 1kHz)">
+              <input id="haptic-test-strength" type="number" min="5" max="100" step="5" value="35" aria-label="Test motor strength percent">%
+            </label>
+            <button type="button" class="decision-pill haptic-btn" id="btn-haptic-left" title="Trigger LEFT motor (GPIO 42)">📳 Left (42)</button>
+            <button type="button" class="decision-pill haptic-btn" id="btn-haptic-center" title="Trigger CENTER motor (GPIO 21)">📳 Center (21)</button>
+            <button type="button" class="decision-pill haptic-btn" id="btn-haptic-right" title="Trigger RIGHT motor (GPIO 47)">📳 Right (47)</button>
+            <button type="button" class="decision-pill haptic-btn" id="btn-haptic-sweep" title="Run Left -> Center -> Right test sequence">🌊 Sweep L→C→R</button>
+            <button type="button" class="decision-pill haptic-btn" id="btn-haptic-all" title="Trigger all 3 motors simultaneously">⚡ All 3</button>
+            <button type="button" class="decision-pill haptic-btn" id="btn-haptic-stop" title="Stop manual test and return to automatic vision haptics">⏹ Auto / Off</button>
+          </div>
+          <span class="small-tag" id="esp32-sensor-badge" title="ESP32 ultrasonic proximity sensor &amp; haptic link">ESP32 SENSOR: STANDBY</span>
+        </div>
         <div class="decision-strip" id="decision-forecast">
           <div class="decision-toggle-group" id="decision-toggle-group" role="group" aria-label="Decision model toggle">
             <button type="button" class="decision-pill" data-backend="gemma4:26b" id="btn-decision-gemma4">🧠 Gemma4:26B</button>

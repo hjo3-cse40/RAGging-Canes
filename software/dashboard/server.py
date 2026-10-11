@@ -134,9 +134,10 @@ class State:
                  memory_ttl_s=12.0, depth_mode='auto', classes_spec='indoor_nav',
                  model_spec='auto', ollama_url='http://127.0.0.1:11434',
                  camera_resolution='320x240', camera_quality=14, stream_mode='auto',
-                 haptic_settings=None):
+                 haptic_settings=None, camera_url=None):
         self.lock = threading.Lock()
         self.mode, self.output, self.max_age = mode, Path(output), max_age
+        self.camera_url = camera_url
         self.rotate = rotate
         self.frame = None
         self.started = None
@@ -146,6 +147,15 @@ class State:
         self.generation = 0
         self.observation_sequence = 0
         self.haptics = HapticController(haptic_settings)
+        self.haptic_override = None
+        self._esp32_sensor = {
+            'ultrasonic_cm': None,
+            'reflex_active': False,
+            'motor_strength_3': [0, 0, 0],
+            'last_seen': None,
+        }
+        self._last_pushed_strengths = [0, 0, 0]
+        self._last_pushed_at = 0.0
         self.classes_spec = classes_spec if classes_spec else 'indoor_nav'
         self.model_spec = str(model_spec or 'auto').strip()
         _, norm_res = normalize_camera_resolution(camera_resolution)
@@ -270,12 +280,127 @@ class State:
             self.arrivals.append(now)
             for _ in frames_out:
                 self.stream_arrivals.append(now)
+            # Determine if live motor output should be pushed directly to ESP32 /haptics
+            cmd_to_push = None
+            if self.camera_url and (self.mode == 'live' or self.haptic_override is not None):
+                hc = self._haptic_locked(latest_dec)
+                strengths = hc.get('motor_strength_3', [0, 0, 0]) if hc.get('valid') else [0, 0, 0]
+                if strengths != self._last_pushed_strengths or (now - self._last_pushed_at >= 0.45):
+                    self._last_pushed_strengths = list(strengths)
+                    self._last_pushed_at = now
+                    cmd_to_push = (self.camera_url, list(strengths), max(400, int(hc.get('ttl_ms') or 900)))
         self.broadcaster.broadcast_paced(frames_out, target_interval_s=avg_gap_s)
+        if cmd_to_push is not None:
+            threading.Thread(
+                target=self._push_esp32_async,
+                args=cmd_to_push,
+                daemon=True,
+            ).start()
+
+    def _push_esp32_async(self, url, strengths, ttl_ms):
+        resp = push_esp32_haptics(url, strengths=strengths, ttl_ms=ttl_ms, timeout=0.35)
+        if resp and resp.get('ok'):
+            self.update_esp32_sensor(resp)
+
+    def update_esp32_sensor(self, payload):
+        if not isinstance(payload, dict):
+            return
+        with self.lock:
+            u_cm = payload.get('ultrasonic_cm')
+            if type(u_cm) in (int, float) and math.isfinite(u_cm):
+                self._esp32_sensor['ultrasonic_cm'] = round(float(u_cm), 1) if u_cm >= 0 else None
+            if isinstance(payload.get('reflex_active'), bool):
+                self._esp32_sensor['reflex_active'] = payload['reflex_active']
+            ms3 = payload.get('motor_strength_3')
+            if isinstance(ms3, list) and len(ms3) == 3:
+                self._esp32_sensor['motor_strength_3'] = [int(x) for x in ms3]
+            self._esp32_sensor['last_seen'] = time.monotonic()
+
+    def _esp32_sensor_snapshot_locked(self):
+        last_seen = self._esp32_sensor.get('last_seen')
+        age_ms = round((time.monotonic() - last_seen) * 1000) if last_seen is not None else None
+        connected = bool(age_ms is not None and age_ms <= 5000)
+        return {
+            'connected': connected,
+            'ultrasonic_cm': self._esp32_sensor.get('ultrasonic_cm') if connected else None,
+            'reflex_active': bool(self._esp32_sensor.get('reflex_active')) if connected else False,
+            'motor_strength_3': list(self._esp32_sensor.get('motor_strength_3', [0, 0, 0])) if connected else [0, 0, 0],
+            'last_seen_age_ms': age_ms,
+        }
+
+    def set_haptic_override(self, strengths=None, duration_s=1.5, label='manual_test', stop=False):
+        now = time.monotonic()
+        if stop or strengths is None:
+            parsed = [0, 0, 0]
+            dur = 0.0
+        else:
+            if not isinstance(strengths, (list, tuple)) or len(strengths) != 3:
+                raise ValueError('strengths must be a 3-element list [Left, Center, Right]')
+            parsed = []
+            for v in strengths:
+                if type(v) is bool or type(v) not in (int, float) or not math.isfinite(v):
+                    raise ValueError('Each motor strength must be a number between 0 and 100')
+                iv = int(round(v))
+                if not 0 <= iv <= 100:
+                    raise ValueError('Each motor strength must be between 0 and 100')
+                parsed.append(iv)
+            if type(duration_s) is bool or type(duration_s) not in (int, float) or not math.isfinite(duration_s) or not 0 <= float(duration_s) <= 5.0:
+                raise ValueError('duration_s must be between 0 and 5.0 seconds')
+            dur = float(duration_s)
+        with self.lock:
+            self.haptics.command_id += 1
+            cid = self.haptics.command_id
+            if dur <= 0 or all(x == 0 for x in parsed):
+                self.haptic_override = None
+                target_ttl = 0
+            else:
+                self.haptic_override = {
+                    'strengths': parsed,
+                    'started': now,
+                    'deadline': now + dur,
+                    'command_id': cid,
+                    'label': str(label or 'manual_test')[:48],
+                }
+                target_ttl = max(100, min(2500, int(dur * 1000)))
+            cam_url = self.camera_url
+            cmd = self._haptic_locked()
+        if cam_url:
+            threading.Thread(
+                target=self._push_esp32_async,
+                args=(cam_url, parsed, target_ttl),
+                daemon=True,
+            ).start()
+        return cmd
 
     def _haptic_locked(self, decision=None):
+        now = time.monotonic()
+        if self.haptic_override is not None:
+            rem_s = self.haptic_override['deadline'] - now
+            if rem_s > 0:
+                ov = self.haptic_override
+                ttl_ms = max(1, min(2500, math.floor(rem_s * 1000)))
+                s3 = list(ov['strengths'])
+                return {
+                    'schema_version': 2,
+                    'session_id': self.haptics.session_id,
+                    'command_id': ov['command_id'],
+                    'source_sequence': self.observation_sequence,
+                    'source_mode': 'live',
+                    'override_active': True,
+                    'override_label': ov['label'],
+                    'valid': True,
+                    'status': 'manual_override',
+                    'motor_valid_3': [True, True, True],
+                    'motor_strength_3': s3,
+                    'zones_3': [1 if x > 0 else 0 for x in s3],
+                    'distance_m_3': [0.5 if x > 0 else None for x in s3],
+                    'confidence_3': [round(x / 100.0, 2) for x in s3],
+                    'ttl_ms': ttl_ms,
+                }
+            self.haptic_override = None
         decision = decision if decision is not None else self.decision_forecaster.latest()
         frame_fresh = (self.frame is not None and self.started is not None
-                       and 0 <= time.monotonic()-self.started < self.max_age
+                       and 0 <= now-self.started < self.max_age
                        and not self.paused and not self.error
                        and self.frame.get('status', 'ok') == 'ok')
         backend_matches = bool(decision and decision.get('requested_backend') == self.decision_forecaster.requested_backend)
@@ -284,6 +409,8 @@ class State:
     def haptic_command(self):
         with self.lock:
             command = self._haptic_locked()
+            if command.get('override_active'):
+                return command
             # Simulated/replayed signals remain visible as previews, never drive hardware.
             if self.mode != 'live' or command.get('source_mode') != 'live':
                 return {**command, 'valid': False, 'status': 'preview_only',
@@ -336,6 +463,7 @@ class State:
             radar_max_range_m = scenario.get('radar_max_range_m', 7.0) if scenario else 7.0
             vlm_depth_report = scenario.get('vlm_depth_report') if scenario else None
             map_mode = 'floor_estimate' if config else ('monocular_depth' if depth_active else 'bearing_only')
+            haptic_snap = self._haptic_locked(decision)
             return {'mode': self.mode, 'status': status, 'valid': valid,
                     'error': self.error, 'age_ms': round(age*1000) if age is not None else None,
                     'max_age_ms': round(self.max_age*1000), 'frame': frame,
@@ -353,7 +481,8 @@ class State:
                     'model_spec': self.model_spec,
                     'scenario': scenario,
                     'decision': decision,
-                    'haptics': {**self._haptic_locked(decision), 'preview_only': self.mode != 'live'},
+                    'haptics': {**haptic_snap, 'preview_only': (self.mode != 'live' and not haptic_snap.get('override_active'))},
+                    'esp32_sensor': self._esp32_sensor_snapshot_locked(),
                     'decision_backend': self.decision_forecaster.requested_backend,
                     'predicted_zones_1s': scenario['predicted_zones_1s'] if scenario else [-1]*6,
                     'predicted_zones_2s': scenario['predicted_zones_2s'] if scenario else [-1]*6,
@@ -552,6 +681,38 @@ def configure_esp32_camera(url, resolution='320x240', quality=14, timeout=0.75):
         except Exception:
             continue
     return {'ok': applied, 'framesize': framesize_idx, 'resolution': norm_res, 'quality': quality_val}
+
+
+def push_esp32_haptics(url, strengths=None, ttl_ms=1200, timeout=0.35):
+    """Push 3-motor strengths [Left, Center, Right] (0..100) to ESP32 /haptics and read ultrasonic_cm."""
+    parsed = urllib.parse.urlsplit(url or '')
+    host = parsed.hostname
+    if not host:
+        return {'ok': False}
+    scheme = 'https' if parsed.scheme in ('https', 'wss') else 'http'
+    port = parsed.port or (443 if scheme == 'https' else 80)
+    candidate_ports = [80, port] if port == 81 else [port]
+    query = ''
+    if isinstance(strengths, (list, tuple)) and len(strengths) == 3:
+        l_val, c_val, r_val = [max(0, min(100, int(round(x)))) for x in strengths]
+        ttl_val = max(0, min(2500, int(ttl_ms)))
+        query = f'?l={l_val}&c={c_val}&r={r_val}&ttl={ttl_val}'
+    for p in candidate_ports:
+        base = f'{scheme}://{host}:{p}'
+        try:
+            req = urllib.request.Request(
+                f'{base}/haptics{query}',
+                headers={'Cache-Control': 'no-cache', 'Connection': 'close'},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    body = json.loads(resp.read(4096).decode('utf-8', errors='replace'))
+                    if isinstance(body, dict):
+                        return {'ok': True, **body}
+                    return {'ok': True}
+        except Exception:
+            continue
+    return {'ok': False}
 
 
 class SnapshotCamera:
@@ -1307,6 +1468,16 @@ def handler_for(state):
                     state.broadcaster.unsubscribe(q)
                 return
 
+            if path == '/command':
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                u_cm = qs.get('ultrasonic_cm', qs.get('dist_cm', [None]))[0]
+                if u_cm is not None:
+                    try:
+                        state.update_esp32_sensor({'ultrasonic_cm': float(u_cm)})
+                    except ValueError:
+                        pass
+                return self.send(200, state.haptic_command())
+
             if path=='/api/state':
                 snapshot=state.snapshot()
                 qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -1376,6 +1547,14 @@ def handler_for(state):
                         stream_mode=payload.get('stream_mode'),
                     )
                     return self.send(200,{'ok':True,**cfg})
+                elif self.path=='/api/haptic_test':
+                    cmd=state.set_haptic_override(
+                        strengths=payload.get('strengths'),
+                        duration_s=payload.get('duration_s', 1.5),
+                        label=payload.get('label', 'manual_test'),
+                        stop=bool(payload.get('stop', False)),
+                    )
+                    return self.send(200,{'ok':True,'haptics':cmd})
                 elif self.path=='/api/decision':
                     backend=payload.get('backend')
                     if backend not in DecisionForecaster.VALID_BACKENDS:
@@ -1499,6 +1678,7 @@ def main():
         camera_quality=args.camera_quality,
         stream_mode=stream_mode,
         haptic_settings=haptic_settings,
+        camera_url=args.camera_url,
     )
     stop = threading.Event()
     server = command_server = command_thread = worker = None

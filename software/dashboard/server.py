@@ -2,11 +2,16 @@
 import argparse
 from collections import deque
 import base64
+import hashlib
 import io
 import http.client
 import json
 import math
+import os
 from pathlib import Path
+import select
+import socket
+import struct
 import threading
 import time
 import urllib.parse
@@ -37,6 +42,35 @@ from software.haptics import Controller as HapticController, Settings as HapticS
 from .geometry import calibration, project
 
 STATIC = Path(__file__).parent
+
+ESP32_FRAMESIZE_MAP = {
+    '96x96': (0, '96x96'),
+    'qqvga': (1, '160x120'),
+    '160x120': (1, '160x120'),
+    'qcif': (2, '176x144'),
+    '176x144': (2, '176x144'),
+    'hqvga': (3, '240x176'),
+    '240x176': (3, '240x176'),
+    '240x240': (4, '240x240'),
+    'qvga': (5, '320x240'),
+    '320x240': (5, '320x240'),
+    'cif': (6, '400x296'),
+    '400x296': (6, '400x296'),
+    'hvga': (7, '480x320'),
+    '480x320': (7, '480x320'),
+    'vga': (8, '640x480'),
+    '640x480': (8, '640x480'),
+    'svga': (9, '800x600'),
+    '800x600': (9, '800x600'),
+}
+VALID_STREAM_MODES = ('auto', 'mjpeg', 'ws', 'snapshot')
+
+
+def normalize_camera_resolution(spec='320x240'):
+    key = str(spec or '320x240').strip().lower()
+    if key not in ESP32_FRAMESIZE_MAP:
+        raise ValueError(f'Unsupported camera resolution: {spec}')
+    return ESP32_FRAMESIZE_MAP[key]
 
 
 class StreamBroadcaster:
@@ -98,7 +132,9 @@ class State:
                  rife_factor=0, device='auto', decision_backend='laya',
                  jev_key_file='private/jev_api_key.txt', start_decision_worker=False,
                  memory_ttl_s=12.0, depth_mode='auto', classes_spec='indoor_nav',
-                 model_spec='auto', ollama_url='http://127.0.0.1:11434', haptic_settings=None):
+                 model_spec='auto', ollama_url='http://127.0.0.1:11434',
+                 camera_resolution='320x240', camera_quality=14, stream_mode='auto',
+                 haptic_settings=None):
         self.lock = threading.Lock()
         self.mode, self.output, self.max_age = mode, Path(output), max_age
         self.rotate = rotate
@@ -112,6 +148,14 @@ class State:
         self.haptics = HapticController(haptic_settings)
         self.classes_spec = classes_spec if classes_spec else 'indoor_nav'
         self.model_spec = str(model_spec or 'auto').strip()
+        _, norm_res = normalize_camera_resolution(camera_resolution)
+        self.camera_resolution = norm_res
+        self.camera_quality = max(4, min(63, int(camera_quality)))
+        self.stream_mode = stream_mode if stream_mode in VALID_STREAM_MODES else 'auto'
+        self.camera_transport = 'mjpeg_stream' if self.stream_mode in ('auto', 'mjpeg') else (
+            'websocket_stream' if self.stream_mode == 'ws' else 'http_keepalive'
+        )
+        self.camera_config_seq = 0
         self.arrivals = deque(maxlen=30)
         self.stream_arrivals = deque(maxlen=90)
         self.broadcaster = StreamBroadcaster()
@@ -297,6 +341,10 @@ class State:
                     'max_age_ms': round(self.max_age*1000), 'frame': frame,
                     'capture_fps': capture_fps,
                     'stream_fps': stream_fps,
+                    'camera_resolution': self.camera_resolution,
+                    'camera_quality': self.camera_quality,
+                    'stream_mode': self.stream_mode,
+                    'camera_transport': self.camera_transport,
                     'rife': rife_info,
                     'depth': depth_info,
                     'depth_mode': self.depth_estimator.mode,
@@ -394,6 +442,28 @@ class State:
         with self.lock:
             self.model_spec = spec
 
+    def set_camera_config(self, resolution=None, quality=None, stream_mode=None):
+        with self.lock:
+            if resolution is not None:
+                _, norm_res = normalize_camera_resolution(resolution)
+                self.camera_resolution = norm_res
+            if quality is not None:
+                if type(quality) is bool or type(quality) is not int or not 4 <= quality <= 63:
+                    raise ValueError('quality must be an integer between 4 and 63')
+                self.camera_quality = quality
+            if stream_mode is not None:
+                if stream_mode not in VALID_STREAM_MODES:
+                    raise ValueError(f'stream_mode must be one of {VALID_STREAM_MODES}')
+                self.stream_mode = stream_mode
+            self.camera_config_seq += 1
+            self.arrivals.clear()
+            self.stream_arrivals.clear()
+            return {
+                'camera_resolution': self.camera_resolution,
+                'camera_quality': self.camera_quality,
+                'stream_mode': self.stream_mode,
+            }
+
     def set_decision_backend(self, backend):
         self.decision_forecaster.set_backend(backend)
         self.decision_forecaster.start()
@@ -443,9 +513,54 @@ def demo_frame(index):
                              'zones':zone_states(box_spans,640,[i/6 for i in range(7)])}
 
 
+def _set_tcp_nodelay(sock):
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
+def configure_esp32_camera(url, resolution='320x240', quality=14, timeout=0.75):
+    """Configure ESP32 OV2640/OV3660 sensor to low-res QVGA (320x240) and fast JPEG quality via /control."""
+    framesize_idx, norm_res = normalize_camera_resolution(resolution)
+    quality_val = max(4, min(63, int(quality)))
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        return {'ok': False, 'framesize': framesize_idx, 'resolution': norm_res, 'quality': quality_val}
+    scheme = 'https' if parsed.scheme in ('https', 'wss') else 'http'
+    port = parsed.port or (443 if scheme == 'https' else 80)
+    candidate_ports = [port]
+    if port == 81:
+        candidate_ports = [80, 81]
+    applied = False
+    for p in candidate_ports:
+        base = f'{scheme}://{host}:{p}'
+        try:
+            for var, val in (('framesize', framesize_idx), ('quality', quality_val)):
+                req = urllib.request.Request(
+                    f'{base}/control?var={var}&val={val}',
+                    headers={'Cache-Control': 'no-cache', 'Connection': 'close'},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        applied = True
+            if applied:
+                break
+        except Exception:
+            continue
+    return {'ok': applied, 'framesize': framesize_idx, 'resolution': norm_res, 'quality': quality_val}
+
+
 class SnapshotCamera:
     """Reuse the camera HTTP connection; reconnect cleanly when closed without overwhelming ESP32 LWIP."""
+    is_persistent_stream = False
+    transport = 'http_keepalive'
+
     def __init__(self, url, timeout):
+        self.url_str = url
         self.url = urllib.parse.urlsplit(url)
         self.timeout = min(float(timeout), 2.5) if timeout > 0 else timeout
         self.cls = http.client.HTTPSConnection if self.url.scheme == 'https' else http.client.HTTPConnection
@@ -453,6 +568,7 @@ class SnapshotCamera:
 
     def _request_once(self):
         if self.connection.sock is not None:
+            _set_tcp_nodelay(self.connection.sock)
             try:
                 self.connection.sock.settimeout(min(self.timeout, 1.8))
             except OSError:
@@ -460,6 +576,7 @@ class SnapshotCamera:
         query = self.url.query + ('&' if self.url.query else '') + '_cb=' + str(time.time_ns())
         path = urllib.parse.urlunsplit(('', '', self.url.path or '/', query, ''))
         self.connection.request('GET', path, headers={'Cache-Control': 'no-cache', 'Accept': 'image/jpeg'})
+        _set_tcp_nodelay(self.connection.sock)
         response = self.connection.getresponse()
         if response.status != 200:
             response.close()
@@ -490,17 +607,24 @@ class SnapshotCamera:
             self.connection = self.cls(self.url.hostname, self.url.port, timeout=self.timeout)
             raise
 
+    def read_latest(self):
+        return self.read()
+
     def close(self):
         self.connection.close()
 
 
 class StreamCamera:
-    """Reads continuous multipart MJPEG stream over a single persistent connection."""
+    """Reads continuous multipart MJPEG stream over a single persistent TCP_NODELAY connection."""
+    is_persistent_stream = True
+    transport = 'mjpeg_stream'
+
     def __init__(self, url, timeout=3.5):
         self.url_str = url
         self.url = urllib.parse.urlsplit(url)
         self.timeout = timeout
         self.response = None
+        self.sock = None
         self.buffer = bytearray()
         self._connect()
 
@@ -511,44 +635,331 @@ class StreamCamera:
             headers={'Cache-Control': 'no-cache', 'Accept': 'multipart/x-mixed-replace, image/jpeg, */*'}
         )
         self.response = urllib.request.urlopen(req, timeout=self.timeout)
+        sock = None
+        try:
+            raw = getattr(getattr(self.response, 'fp', None), 'raw', None)
+            sock = getattr(raw, '_sock', None)
+        except Exception:
+            sock = None
+        self.sock = sock
+        _set_tcp_nodelay(self.sock)
         self.buffer.clear()
 
+    def _read_fn(self):
+        read_fn = getattr(self.response, 'read1', None)
+        if read_fn is None and hasattr(self.response, 'fp') and hasattr(self.response.fp, 'read1'):
+            read_fn = self.response.fp.read1
+        if read_fn is None:
+            read_fn = self.response.read
+        return read_fn
+
+    def _pop_first_frame(self):
+        soi = self.buffer.find(b'\xff\xd8')
+        if soi != -1:
+            eoi = self.buffer.find(b'\xff\xd9', soi + 2)
+            if eoi != -1:
+                frame = bytes(self.buffer[soi:eoi + 2])
+                del self.buffer[:eoi + 2]
+                if len(frame) > MAX_BYTES:
+                    raise ValueError('Camera JPEG exceeds the size limit')
+                return frame
+        return None
+
     def read(self):
+        if self.response is None:
+            self._connect()
+        read_fn = self._read_fn()
         while True:
-            soi = self.buffer.find(b'\xff\xd8')
-            if soi != -1:
-                eoi = self.buffer.find(b'\xff\xd9', soi + 2)
-                if eoi != -1:
-                    frame = bytes(self.buffer[soi:eoi + 2])
-                    del self.buffer[:eoi + 2]
-                    if len(frame) > MAX_BYTES:
-                        raise ValueError('Camera JPEG exceeds the size limit')
-                    return frame
-            read_fn = getattr(self.response, 'read1', None)
-            if read_fn is None and hasattr(self.response, 'fp') and hasattr(self.response.fp, 'read1'):
-                read_fn = self.response.fp.read1
-            if read_fn is None:
-                read_fn = self.response.read
+            frame = self._pop_first_frame()
+            if frame is not None:
+                return frame
             chunk = read_fn(8192)
             if not chunk:
+                self.close()
                 raise OSError('Camera stream closed')
             self.buffer.extend(chunk)
+            if len(self.buffer) > MAX_BYTES * 2:
+                del self.buffer[:-MAX_BYTES]
+
+    def read_latest(self):
+        """Return the newest complete JPEG frame, non-blockingly draining any queued burst in the socket."""
+        frame = self.read()
+        if self.response is None:
+            return frame
+        if self.sock is not None:
+            read_fn = self._read_fn()
+            for _ in range(8):
+                try:
+                    ready, _, _ = select.select([self.sock], [], [], 0.0)
+                    if not ready:
+                        break
+                    chunk = read_fn(16384)
+                    if not chunk:
+                        break
+                    self.buffer.extend(chunk)
+                except Exception:
+                    break
+        while True:
+            newer = self._pop_first_frame()
+            if newer is None:
+                break
+            frame = newer
+        return frame
 
     def close(self):
         if self.response:
             try: self.response.close()
             except Exception: pass
             self.response = None
+        self.sock = None
         self.buffer.clear()
 
 
-def create_camera(url, timeout, is_stream=None):
-    """Instantiate camera reader: StreamCamera for MJPEG streams, SnapshotCamera for pulls."""
-    if is_stream is True or (is_stream is None and ('/stream' in url or 'mjpeg' in url.lower() or 'mjpg' in url.lower())):
-        try:
-            return StreamCamera(url, timeout)
-        except Exception:
-            return SnapshotCamera(url, timeout)
+class WebSocketCamera:
+    """Reads continuous binary JPEG frames over a persistent RFC 6455 WebSocket (/ws) with TCP_NODELAY."""
+    is_persistent_stream = True
+    transport = 'websocket_stream'
+
+    def __init__(self, url, timeout=3.5):
+        self.url_str = url
+        self.url = urllib.parse.urlsplit(url)
+        self.timeout = timeout
+        self.sock = None
+        self.buffer = bytearray()
+        self._connect()
+
+    def _connect(self):
+        self.close()
+        host = self.url.hostname or '127.0.0.1'
+        port = self.url.port or (443 if self.url.scheme in ('wss', 'https') else 80)
+        path = self.url.path or '/ws'
+        if self.url.query:
+            path = f'{path}?{self.url.query}'
+        sock = socket.create_connection((host, port), timeout=self.timeout)
+        _set_tcp_nodelay(sock)
+        key_bytes = base64.b64encode(os.urandom(16)).decode('ascii')
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key_bytes + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')).digest()
+        ).decode('ascii')
+        handshake = (
+            f'GET {path} HTTP/1.1\r\n'
+            f'Host: {host}:{port}\r\n'
+            f'Upgrade: websocket\r\n'
+            f'Connection: Upgrade\r\n'
+            f'Sec-WebSocket-Key: {key_bytes}\r\n'
+            f'Sec-WebSocket-Version: 13\r\n\r\n'
+        ).encode('ascii')
+        sock.sendall(handshake)
+        header_buf = bytearray()
+        while b'\r\n\r\n' not in header_buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                sock.close()
+                raise OSError('WebSocket handshake closed by peer')
+            header_buf.extend(chunk)
+            if len(header_buf) > 16384:
+                sock.close()
+                raise OSError('WebSocket handshake headers too large')
+        sep = header_buf.index(b'\r\n\r\n')
+        header_text = header_buf[:sep].decode('latin1', errors='replace')
+        status_line = header_text.splitlines()[0] if header_text else ''
+        if '101' not in status_line:
+            sock.close()
+            raise OSError(f'WebSocket upgrade rejected: {status_line}')
+        if expected_accept not in header_text:
+            sock.close()
+            raise OSError('WebSocket Sec-WebSocket-Accept mismatch')
+        self.sock = sock
+        self.buffer = bytearray(header_buf[sep + 4:])
+
+    def _ensure_bytes(self, n):
+        while len(self.buffer) < n:
+            chunk = self.sock.recv(max(8192, n - len(self.buffer)))
+            if not chunk:
+                self.close()
+                raise OSError('WebSocket stream closed')
+            self.buffer.extend(chunk)
+
+    def _read_ws_frame(self):
+        if self.sock is None:
+            self._connect()
+        fragments = bytearray()
+        while True:
+            self._ensure_bytes(2)
+            b0, b1 = self.buffer[0], self.buffer[1]
+            fin = (b0 & 0x80) != 0
+            opcode = b0 & 0x0F
+            masked = (b1 & 0x80) != 0
+            payload_len = b1 & 0x7F
+            offset = 2
+            if payload_len == 126:
+                self._ensure_bytes(4)
+                payload_len = struct.unpack('!H', self.buffer[2:4])[0]
+                offset = 4
+            elif payload_len == 127:
+                self._ensure_bytes(10)
+                payload_len = struct.unpack('!Q', self.buffer[2:10])[0]
+                offset = 10
+            if payload_len > MAX_BYTES:
+                self.close()
+                raise ValueError('WebSocket frame exceeds size limit')
+            mask_key = None
+            if masked:
+                self._ensure_bytes(offset + 4)
+                mask_key = bytes(self.buffer[offset:offset + 4])
+                offset += 4
+            self._ensure_bytes(offset + payload_len)
+            payload = bytearray(self.buffer[offset:offset + payload_len])
+            del self.buffer[:offset + payload_len]
+            if mask_key:
+                for i in range(len(payload)):
+                    payload[i] ^= mask_key[i & 3]
+            if opcode == 0x8:  # Close
+                self.close()
+                raise OSError('WebSocket closed by camera')
+            if opcode == 0x9:  # Ping -> send masked Pong
+                try:
+                    pong_mask = os.urandom(4)
+                    masked_pong = bytes(payload[i] ^ pong_mask[i & 3] for i in range(min(len(payload), 125)))
+                    self.sock.sendall(bytes([0x8A, 0x80 | len(masked_pong)]) + pong_mask + masked_pong)
+                except OSError:
+                    pass
+                continue
+            if opcode == 0xA:  # Pong
+                continue
+            fragments.extend(payload)
+            if fin:
+                return bytes(fragments)
+
+    def read(self):
+        while True:
+            data = self._read_ws_frame()
+            soi = data.find(b'\xff\xd8')
+            eoi = data.rfind(b'\xff\xd9')
+            if soi != -1 and eoi != -1 and eoi > soi:
+                return data[soi:eoi + 2]
+
+    def read_latest(self):
+        frame = self.read()
+        if self.sock is None:
+            return frame
+        for _ in range(6):
+            try:
+                ready, _, _ = select.select([self.sock], [], [], 0.0)
+                if not ready and len(self.buffer) < 2:
+                    break
+                if ready:
+                    chunk = self.sock.recv(16384)
+                    if not chunk:
+                        break
+                    self.buffer.extend(chunk)
+                if len(self.buffer) >= 2:
+                    b1 = self.buffer[1]
+                    plen = b1 & 0x7F
+                    hdr = 2 + (2 if plen == 126 else 8 if plen == 127 else 0) + (4 if (b1 & 0x80) else 0)
+                    if len(self.buffer) < hdr:
+                        break
+                    if plen == 126:
+                        plen = struct.unpack('!H', self.buffer[2:4])[0]
+                    elif plen == 127:
+                        plen = struct.unpack('!Q', self.buffer[2:10])[0]
+                    if len(self.buffer) < hdr + plen:
+                        break
+                    cand = self.read()
+                    if cand:
+                        frame = cand
+            except Exception:
+                break
+        return frame
+
+    def close(self):
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+            self.sock = None
+        self.buffer.clear()
+
+
+def _candidate_stream_urls(url):
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path or '/'
+    scheme = 'https' if parsed.scheme in ('https', 'wss') else 'http'
+    host = parsed.hostname or '127.0.0.1'
+    port = parsed.port
+    candidates = []
+    if '/stream' in path or 'mjpeg' in url.lower() or 'mjpg' in url.lower():
+        candidates.append(url)
+        if port in (None, 80) and path == '/stream':
+            candidates.append(f'{scheme}://{host}:81/stream')
+    elif path.endswith('/capture') or path == '/':
+        base_netloc = f'{host}:{port}' if port else host
+        candidates.append(urllib.parse.urlunsplit((scheme, base_netloc, '/stream', parsed.query, '')))
+        if port in (None, 80):
+            candidates.append(urllib.parse.urlunsplit((scheme, f'{host}:81', '/stream', parsed.query, '')))
+    else:
+        candidates.append(url)
+    return candidates
+
+
+def _candidate_ws_urls(url):
+    parsed = urllib.parse.urlsplit(url)
+    ws_scheme = 'wss' if parsed.scheme in ('https', 'wss') else 'ws'
+    host = parsed.hostname or '127.0.0.1'
+    port = parsed.port
+    base_netloc = f'{host}:{port}' if port else host
+    path = parsed.path if parsed.path and parsed.path.endswith('/ws') else '/ws'
+    candidates = [urllib.parse.urlunsplit((ws_scheme, base_netloc, path, parsed.query, ''))]
+    if port in (None, 80):
+        candidates.append(urllib.parse.urlunsplit((ws_scheme, f'{host}:81', '/ws', parsed.query, '')))
+    return candidates
+
+
+def create_camera(url, timeout, is_stream=None, resolution='320x240', quality=14, configure_sensor=False):
+    """Instantiate camera reader: StreamCamera / WebSocketCamera for persistent streams, SnapshotCamera fallback."""
+    if configure_sensor:
+        configure_esp32_camera(url, resolution=resolution, quality=quality, timeout=min(float(timeout), 0.75))
+
+    parsed = urllib.parse.urlsplit(url)
+    url_lower = url.lower()
+    is_ws_url = parsed.scheme in ('ws', 'wss') or parsed.path.endswith('/ws')
+    is_mjpeg_url = '/stream' in parsed.path or 'mjpeg' in url_lower or 'mjpg' in url_lower
+
+    if is_stream == 'snapshot' or is_stream is False:
+        return SnapshotCamera(url, timeout)
+
+    if is_stream == 'ws' or (is_stream in (None, True, 'auto') and is_ws_url):
+        for ws_url in _candidate_ws_urls(url):
+            try:
+                return WebSocketCamera(ws_url, timeout)
+            except Exception:
+                continue
+        if is_ws_url:
+            fallback_http = urllib.parse.urlunsplit((
+                'https' if parsed.scheme == 'wss' else 'http',
+                parsed.netloc,
+                '/capture',
+                parsed.query,
+                '',
+            ))
+            return SnapshotCamera(fallback_http, timeout)
+
+    if is_stream in (True, 'auto', 'mjpeg') or (is_stream is None and is_mjpeg_url):
+        for stream_url in _candidate_stream_urls(url):
+            try:
+                return StreamCamera(stream_url, timeout)
+            except Exception:
+                continue
+        if is_stream == 'auto':
+            for ws_url in _candidate_ws_urls(url):
+                try:
+                    return WebSocketCamera(ws_url, timeout)
+                except Exception:
+                    continue
+        fallback_url = url
+        if parsed.path.endswith('/stream'):
+            fallback_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, '/capture', parsed.query, ''))
+        return SnapshotCamera(fallback_url, timeout)
+
     return SnapshotCamera(url, timeout)
 
 
@@ -593,14 +1004,15 @@ class LatestFrameBuffer:
 
 def prepare_frame_and_rotate(raw_bytes, rotate):
     """Fast in-memory decode and rotation. Returns (rotated_jpeg_bytes, image_input, width, height)."""
-    if not rotate:
-        return raw_bytes, None, None, None
     try:
         import cv2
         import numpy as np
         nparr = np.frombuffer(raw_bytes, np.uint8)
         bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if bgr is not None:
+            if not rotate:
+                h, w = bgr.shape[:2]
+                return raw_bytes, bgr, w, h
             if rotate == 90:
                 bgr = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
             elif rotate == 180:
@@ -608,14 +1020,16 @@ def prepare_frame_and_rotate(raw_bytes, rotate):
             elif rotate == 270:
                 bgr = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
             h, w = bgr.shape[:2]
-            _, enc = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+            _, enc = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
             return enc.tobytes(), bgr, w, h
     except (ImportError, Exception):
         pass
+    if not rotate:
+        return raw_bytes, None, None, None
     # Pillow fallback
     image = decode_jpeg(raw_bytes).rotate(-rotate, expand=True)
     output = io.BytesIO()
-    image.save(output, format='JPEG', quality=88)
+    image.save(output, format='JPEG', quality=85)
     return output.getvalue(), image, image.width, image.height
 
 
@@ -626,7 +1040,25 @@ def run_source(state, args, stop):
     buffer = LatestFrameBuffer()
     try:
         if args.camera_url:
-            camera = create_camera(args.camera_url, args.timeout, getattr(args, 'stream', None))
+            with state.lock:
+                init_res = state.camera_resolution
+                init_qual = state.camera_quality
+                init_stream_mode = state.stream_mode
+                applied_cfg_seq = state.camera_config_seq
+            effective_stream = (
+                'snapshot' if getattr(args, 'no_stream', False)
+                else (True if getattr(args, 'stream', False) else init_stream_mode)
+            )
+            camera = create_camera(
+                args.camera_url,
+                args.timeout,
+                is_stream=effective_stream,
+                resolution=init_res,
+                quality=init_qual,
+                configure_sensor=True,
+            )
+            with state.lock:
+                state.camera_transport = getattr(camera, 'transport', 'mjpeg_stream')
             pipeline = Pipeline(
                 args.output / 'yolo',
                 detect=True,
@@ -640,29 +1072,76 @@ def run_source(state, args, stop):
 
             # Dedicated producer thread reads camera continuously without blocking YOLO
             def producer_loop():
+                nonlocal camera, applied_cfg_seq
                 consecutive_errors = 0
+                sensor_configured = (getattr(camera, 'transport', '') != 'http_keepalive')
                 while not stop.is_set():
                     with state.lock:
                         paused, current_mode = state.paused, state.mode
+                        cfg_seq = state.camera_config_seq
+                        target_res = state.camera_resolution
+                        target_qual = state.camera_quality
+                        target_stream_mode = state.stream_mode
                     if paused or current_mode != 'live':
                         if camera: camera.close()
                         stop.wait(0.1)
                         continue
+                    if cfg_seq != applied_cfg_seq:
+                        applied_cfg_seq = cfg_seq
+                        sensor_configured = False
+                        try:
+                            if camera:
+                                camera.close()
+                            camera = create_camera(
+                                args.camera_url,
+                                args.timeout,
+                                is_stream=target_stream_mode,
+                                resolution=target_res,
+                                quality=target_qual,
+                                configure_sensor=True,
+                            )
+                            sensor_configured = True
+                            with state.lock:
+                                state.camera_transport = getattr(camera, 'transport', 'mjpeg_stream')
+                        except Exception:
+                            pass
                     started = time.monotonic()
                     try:
-                        raw = camera.read()
+                        if not sensor_configured:
+                            # ESP32 may have powered on after server start; configure 320x240 & try stream
+                            try:
+                                new_cam = create_camera(
+                                    args.camera_url,
+                                    args.timeout,
+                                    is_stream=target_stream_mode,
+                                    resolution=target_res,
+                                    quality=target_qual,
+                                    configure_sensor=True,
+                                )
+                                if camera:
+                                    camera.close()
+                                camera = new_cam
+                                sensor_configured = True
+                            except Exception:
+                                pass
+                        read_fn = getattr(camera, 'read_latest', camera.read)
+                        raw = read_fn()
                         fetched = time.monotonic()
                         buffer.put((raw, started, fetched))
                         consecutive_errors = 0
                         with state.lock:
                             state.error = None
-                        stop.wait(0.05)
+                            state.camera_transport = getattr(camera, 'transport', state.camera_transport)
+                        if not getattr(camera, 'is_persistent_stream', False):
+                            stop.wait(0.015)
                     except Exception as exc:
                         consecutive_errors += 1
+                        if consecutive_errors >= 2:
+                            sensor_configured = False
                         with state.lock:
                             if consecutive_errors >= 8 or (state.frame is None and consecutive_errors >= 3):
                                 state.error = str(exc)
-                        stop.wait(0.35 if consecutive_errors < 4 else 0.60)
+                        stop.wait(0.25 if consecutive_errors < 4 else 0.50)
                 if camera:
                     camera.close()
 
@@ -740,6 +1219,7 @@ def run_source(state, args, stop):
                         image_input=image_input
                     )
                     result['capture_ms'] = round((fetched - started) * 1000, 2)
+                    result['camera_transport'] = getattr(camera, 'transport', state.camera_transport)
                     raw_to_publish = rotated_jpeg
                 elif current_mode == 'replay' and replay:
                     started = time.monotonic()
@@ -889,6 +1369,13 @@ def handler_for(state):
                         raise ValueError('model must be a non-empty detector model name or auto')
                     state.set_model(mdl_spec)
                     return self.send(200,{'ok':True,'model_spec':state.model_spec,'resolved_model':resolve_detector_model(state.model_spec)})
+                elif self.path=='/api/camera':
+                    cfg=state.set_camera_config(
+                        resolution=payload.get('resolution'),
+                        quality=payload.get('quality'),
+                        stream_mode=payload.get('stream_mode'),
+                    )
+                    return self.send(200,{'ok':True,**cfg})
                 elif self.path=='/api/decision':
                     backend=payload.get('backend')
                     if backend not in DecisionForecaster.VALID_BACKENDS:
@@ -913,7 +1400,11 @@ def handler_for(state):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--camera-url', default=None, help='Camera HTTP JPEG/stream endpoint')
+    p.add_argument('--camera-url', default=None, help='Camera HTTP MJPEG (/stream), WebSocket (ws://.../ws), or snapshot (/capture) endpoint')
+    p.add_argument('--camera-res', default='320x240', help='ESP32 sensor resolution (default: 320x240 QVGA for ~50-90ms low latency)')
+    p.add_argument('--camera-quality', type=int, default=14, help='ESP32 JPEG compression quality 4-63 (default: 14)')
+    p.add_argument('--stream-mode', choices=list(VALID_STREAM_MODES), default='auto', help='Camera transport mode: auto, mjpeg, ws, or snapshot')
+    p.add_argument('--no-stream', action='store_true', help='Disable persistent MJPEG/WebSocket stream and force HTTP snapshot polling')
     p.add_argument('--replay', type=Path, default=None, help='Dataset directory for replay')
     p.add_argument('--demo', action='store_true', help='Start in simulation mode')
     p.add_argument('--mode', choices=['live', 'simulation', 'replay'], default=None, help='Initial feed mode')
@@ -957,17 +1448,18 @@ def main():
     else:
         mode = 'simulation'
     if args.camera_url is None and not args.demo and not args.replay:
-        args.camera_url = 'http://169.233.72.178/capture'
+        args.camera_url = 'http://169.233.72.178/stream'
     if args.rotate is None:
         args.rotate = 270 if mode == 'live' else 0
-    if args.interval is None: args.interval=0.04 if args.camera_url else .5
+    if args.interval is None: args.interval=0.01 if args.camera_url else .5
     if (not 1 <= args.port <= 65535 or not all(math.isfinite(v) for v in (args.interval,args.timeout,args.max_age,args.memory_ttl))
             or args.interval < 0 or args.timeout <= 0 or args.max_age <= 0 or not 0 <= args.rife_factor <= 8
-            or not 0 <= args.memory_ttl <= 60):
-        p.error('Invalid port, timing, memory TTL, or RIFE factor settings.')
-    if args.camera_url and urllib.parse.urlsplit(args.camera_url).scheme not in ('http','https'):
-        p.error('Camera URL must use HTTP or HTTPS.')
+            or not 0 <= args.memory_ttl <= 60 or not 4 <= args.camera_quality <= 63):
+        p.error('Invalid port, timing, memory TTL, camera quality, or RIFE factor settings.')
+    if args.camera_url and urllib.parse.urlsplit(args.camera_url).scheme not in ('http','https','ws','wss'):
+        p.error('Camera URL must use HTTP, HTTPS, WS, or WSS.')
     try:
+        normalize_camera_resolution(args.camera_res)
         payload=json.loads(args.calibration.read_text()) if args.calibration else None
         if args.calibration and not isinstance(payload,dict):
             p.error('Calibration file is empty or cleared; calibrate again in the dashboard.')
@@ -986,6 +1478,7 @@ def main():
             raise ValueError('Command token must be a nonempty ASCII token without whitespace')
     except (ValueError, OSError) as exc:
         p.error(str(exc))
+    stream_mode = 'snapshot' if args.no_stream else ('mjpeg' if args.stream else args.stream_mode)
     state=State(
         mode,
         args.output,
@@ -1002,6 +1495,9 @@ def main():
         classes_spec=args.classes,
         model_spec=args.model,
         ollama_url=args.ollama_url,
+        camera_resolution=args.camera_res,
+        camera_quality=args.camera_quality,
+        stream_mode=stream_mode,
         haptic_settings=haptic_settings,
     )
     stop = threading.Event()

@@ -1,15 +1,52 @@
-# ESP32 motor and detection clients
+# ESP32 camera streaming, motor, and detection clients
 
 The current wearable uses three motors: left, center, right. For variable strength, follow [the haptic integration guide](../HAPTICS.md).
 
-| Backend | Client | Output | Default port |
+| Component / Backend | Header | Output / Role | Default port / Path |
 | --- | --- | --- | --- |
-| Dashboard depth + decision pipeline | `HapticClient.h` | 3 strengths, 0–100, schema v2 | 8002 |
-| YOLO `/command?zones=3` | `ThreeZoneClient.h` | 3 binary detections | 8001 |
-| YOLO legacy | `SixZoneClient.h` | 6 binary detections | 8001 |
-| Nemotron legacy | `ZoneClient.h` | 5 binary detections | 8000 |
+| **Low-Latency 320×240 Stream** | `FastStreamServer.h` | Persistent MJPEG (`/stream`) + Binary WebSocket (`/ws`) at `FRAMESIZE_QVGA` | `80` (`/stream`, `/ws`, `/capture`, `/control`) & `81` |
+| **Dashboard depth + decision pipeline** | `HapticClient.h` | 3 strengths, 0–100, schema v2 | `8002` (`/command`) |
+| **YOLO `/command?zones=3`** | `ThreeZoneClient.h` | 3 binary detections (`[Left, Center, Right]`) | `8001` (`/command?zones=3`) |
+| **YOLO legacy** | `SixZoneClient.h` | 6 binary detections | `8001` (`/command`) |
+| **Nemotron legacy** | `ZoneClient.h` | 5 binary detections | `8000` (`/command`) |
 
-`HapticMotors.h` is an optional active-high PWM motor-driver adapter for `HapticClient.h`. It needs explicit pin, LEDC channel/timer, frequency and duty calibration. No motor pins are selected by default. The full working camera sketch remains on the Mac attached to the ESP32. The following sections document retained binary clients; they do not accept variable strengths.
+`HapticMotors.h` is an optional active-high PWM motor-driver adapter for `HapticClient.h`. It needs explicit pin, LEDC channel/timer, frequency and duty calibration. No motor pins are selected by default. The full working camera sketch remains on the Mac attached to the ESP32. The following sections document the low-latency stream server and retained binary clients.
+
+---
+
+## Low-Latency 320×240 (QVGA) Persistent MJPEG / WebSocket Stream (`FastStreamServer.h`)
+
+`FastStreamServer.h` eliminates the ~550–700 ms per-frame HTTP `/capture` bottleneck and achieves **~45–85 ms frame delivery (~12–20 FPS)** by combining:
+1. **`FRAMESIZE_QVGA` (`320×240`) + `jpeg_quality = 14`** (~4–7 KB per JPEG vs ~35 KB at VGA).
+2. **`CAMERA_GRAB_LATEST` + 2 PSRAM framebuffers** so `esp_camera_fb_get()` always returns the newest exposure instead of a queued frame.
+3. **`WiFi.setSleep(false)` (`WIFI_PS_NONE`)** to prevent ESP32 Wi-Fi modem sleep from adding 100–300 ms DTIM beacon delays.
+4. **Persistent `GET /stream` (Multipart MJPEG) and `GET /ws` (RFC 6455 Binary WebSocket)** with `TCP_NODELAY` on port `80` (and port `81`), allowing single-port SSH tunnels (`-R 8117:ESP32_IP:80`) to stream continuously.
+
+### Option A: Drop-in with existing `startCameraServer()` sketch
+If your sketch already calls `startCameraServer()`, simply call `FastStreamServer::optimizeLiveSensor()` after `esp_camera_init()` and `WiFi.begin()`:
+
+```cpp
+#include "FastStreamServer.h"
+#include "ThreeZoneClient.h"
+
+// Before esp_camera_init(&config):
+FastStreamServer::applyLowLatencyConfig(config, FRAMESIZE_QVGA, 14);
+
+// In setup(), after WiFi is connected and camera is initialized:
+FastStreamServer::optimizeLiveSensor(FRAMESIZE_QVGA, 14);
+```
+
+### Option B: Replace `startCameraServer()` with `FastStreamServer` (exposes `/stream` and `/ws` on port 80)
+
+```cpp
+#include "FastStreamServer.h"
+FastStreamServer streamServer(80, 81);
+
+// In setup() after esp_camera_init() and WiFi connection:
+streamServer.begin(FRAMESIZE_QVGA, 14);
+```
+
+---
 
 ## Six-zone YOLO client
 

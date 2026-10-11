@@ -233,7 +233,8 @@ class Pipeline:
         if self.model is not None:
             class_ids = [i for i, name in self.model.names.items()
                          if name in self.class_names]
-            result = self.model.predict(image, device=self.device, imgsz=640,
+            infer_imgsz = 320 if max(width, height) <= 360 else (480 if max(width, height) <= 480 else 640)
+            result = self.model.predict(image, device=self.device, imgsz=infer_imgsz,
                                         conf=self.confidence, classes=class_ids,
                                         verbose=False)[0]
             for box in result.boxes:
@@ -414,10 +415,12 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--path", help="Saved JPEG for image mode")
-    parser.add_argument("--url", help="ESP32 JPEG snapshot URL, not MJPEG stream")
-    parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--url", help="ESP32 stream (/stream, ws://.../ws) or snapshot (/capture) URL")
+    parser.add_argument("--stream", action="store_true", help="Use persistent low-latency MJPEG/WebSocket stream")
+    parser.add_argument("--resolution", default="320x240", help="ESP32 camera resolution preset (default: 320x240 QVGA)")
+    parser.add_argument("--interval", type=float, default=None, help="Sampling interval in seconds (default: 0.01 for stream, 1.0 for snapshot)")
     parser.add_argument("--max-result-age-ms", type=int, default=1000)
-    parser.add_argument("--timeout", type=float, default=3.0, help="Snapshot fetch timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=3.0, help="Snapshot/stream socket timeout in seconds")
     parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=270,
                         help="Clockwise rotation before detection (default: 270 for 90° CW mount / 90° CCW correction)")
     parser.add_argument("--frames", type=int, default=0, help="Stop pull mode after N attempts; 0 runs until stopped")
@@ -425,6 +428,19 @@ def main():
     parser.add_argument("--idle-without-client", action="store_true",
                         help="Pull only while /command has been polled within five seconds")
     args = parser.parse_args()
+    use_stream = bool(
+        args.stream or (
+            args.url and (
+                args.url.startswith(("ws://", "wss://"))
+                or "/stream" in args.url
+                or "/ws" in args.url
+                or "mjpeg" in args.url.lower()
+                or "mjpg" in args.url.lower()
+            )
+        )
+    )
+    if args.interval is None:
+        args.interval = 0.005 if use_stream else 1.0
     if args.mode == "image" and not args.path:
         parser.error("image mode requires --path")
     if args.mode == "pull" and (not args.url or args.interval <= 0):
@@ -463,6 +479,19 @@ def main():
         print(f"Pulling {args.url}; results on port {args.port}", flush=True)
         frame_id = 0
         session_id = uuid.uuid4().hex[:8]
+        stream_cam = None
+        if use_stream:
+            try:
+                from software.dashboard.server import create_camera
+            except ImportError:
+                from dashboard.server import create_camera
+            stream_cam = create_camera(
+                args.url,
+                args.timeout,
+                is_stream=True,
+                resolution=args.resolution,
+                configure_sensor=True,
+            )
         try:
             while args.frames == 0 or frame_id < args.frames:
                 if args.idle_without_client:
@@ -474,12 +503,16 @@ def main():
                 started = time.monotonic()
                 frame_id += 1
                 try:
-                    parts = urllib.parse.urlsplit(args.url)
-                    query = urllib.parse.parse_qsl(parts.query) + [("_cb", str(time.time_ns()))]
-                    snapshot_url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
-                    request = urllib.request.Request(snapshot_url, headers={"Cache-Control": "no-cache"})
-                    with urllib.request.urlopen(request, timeout=args.timeout) as response:
-                        data = response.read(MAX_BYTES + 1)
+                    if stream_cam is not None:
+                        read_fn = getattr(stream_cam, "read_latest", stream_cam.read)
+                        data = read_fn()
+                    else:
+                        parts = urllib.parse.urlsplit(args.url)
+                        query = urllib.parse.parse_qsl(parts.query) + [("_cb", str(time.time_ns()))]
+                        snapshot_url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+                        request = urllib.request.Request(snapshot_url, headers={"Cache-Control": "no-cache"})
+                        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+                            data = response.read(MAX_BYTES + 1)
                     with pipeline.lock:
                         result = pipeline.process(data, f"{session_id}-{frame_id}", started)
                     result["fetch_to_result_ms"] = round((time.monotonic() - started) * 1000, 2)
@@ -499,6 +532,8 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
+            if stream_cam is not None:
+                stream_cam.close()
             server.shutdown()
             server.server_close()
 

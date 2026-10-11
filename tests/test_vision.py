@@ -37,6 +37,14 @@ class VisionTests(unittest.TestCase):
         with self.assertRaises(Exception):
             parse_boundaries("0,.2,.1,.4,.6,.8,1")
 
+    def test_pipeline_rotation_transposes_image_and_artifacts(self):
+        rot_pipeline = Pipeline(self.directory.name, rotate=90)
+        response = rot_pipeline.process(self.jpeg, "rot-1")
+        self.assertEqual(response["width"], 480)
+        self.assertEqual(response["height"], 640)
+        with Image.open(Path(self.directory.name) / "latest.jpg") as saved:
+            self.assertEqual(saved.size, (480, 640))
+
     def test_receive_only_is_unknown_and_old_results_expire(self):
         response = self.pipeline.process(self.jpeg, "42")
         self.assertEqual(response["zones"], [-1] * 6)

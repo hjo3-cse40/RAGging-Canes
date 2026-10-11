@@ -17,6 +17,10 @@ The repository includes two independently runnable vision backends and their mat
 
 The current hardware target is six directional motors. The five-zone Nemotron backend remains available for the existing teammate setup; its client is not interchangeable with the six-zone client. The comparison tool can request six zones from Nemotron, but this does not change the production Nemotron service.
 
+## YOLO camera and bird’s-eye dashboard
+
+The local dashboard provides camera images, YOLO overlays, directional zones, and an optional calibrated floor map. Start a GPU-free preview with `python3 -m software.dashboard --demo`, then open `http://127.0.0.1:8080`. See [dashboard setup, calibration, and test conditions](DASHBOARD.md) for live GX10 operation and replay. Metric projection requires a stationary camera and measured floor markers; moving-camera room mapping is not implemented.
+
 ## Run either backend from one checkout
 
 Clone this repository, or use `git pull --ff-only` in a clean checkout. On a machine with local edits, commit or stash them and reconcile any conflicts first. Run commands from the repository root on GX10. Replace `ESP32_IP` with the current camera address.

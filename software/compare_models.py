@@ -15,7 +15,7 @@ import urllib.request
 from software.vision import MAX_BYTES, Pipeline, decode_jpeg
 
 
-def nemotron(data, url, timeout, zones):
+def nemotron(data, url, timeout, zones, temperature=0, seed=None):
     # Five zones reproduces the teammate's prompt/classes; six aligns with YOLO.
     count = "five" if zones == 5 else "six"
     classes = "person, chair, table, or box" if zones == 5 else "person or chair"
@@ -27,12 +27,14 @@ def nemotron(data, url, timeout, zones):
     )
     payload = {
         "model": "nemotron3:33b", "think": False, "stream": False,
-        "keep_alive": "10m", "options": {"temperature": 0, "num_predict": 64},
+        "keep_alive": "10m", "options": {"temperature": temperature, "num_predict": 64},
         "messages": [{"role": "user", "content": prompt,
                       "images": [base64.b64encode(data).decode("ascii")]}],
         "format": {"type": "array", "items": {"type": "integer", "enum": [-1, 0, 1]},
                    "minItems": zones, "maxItems": zones},
     }
+    if seed is not None:
+        payload["options"]["seed"] = seed
     request = urllib.request.Request(url.rstrip("/") + "/api/chat",
                                      json.dumps(payload).encode(),
                                      {"Content-Type": "application/json"})
@@ -44,7 +46,8 @@ def nemotron(data, url, timeout, zones):
     if not (isinstance(values, list) and len(values) == zones
             and all(type(v) is int and v in (-1, 0, 1) for v in values)):
         raise ValueError("Invalid zone response")
-    return {"zones": values, "valid": True,
+    return {"zones": values, "valid": True, "temperature": temperature, "seed": seed,
+            "think": False, "thinking_chars": len(body["message"].get("thinking", "")),
             "ollama_total_ms": body.get("total_duration", 0) / 1e6,
             "load_ms": body.get("load_duration", 0) / 1e6}
 

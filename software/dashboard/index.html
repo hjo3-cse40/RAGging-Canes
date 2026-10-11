@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Canes / Tesla Surround View</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <header>
+    <a class="brand" href="/" aria-label="Canes home">
+      <span class="logo">⚡</span>
+      CANES
+      <span class="divider"></span>
+      <span class="subbrand">Surround View</span>
+    </a>
+    <div class="header-right">
+      <span class="badge" id="source">INITIALIZING</span>
+      <span id="connection"><i></i> Connecting to stream</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="intro">
+      <div>
+        <div class="eyebrow">TESLA-STYLE SPATIAL PERCEPTION · YOLO REAL-TIME</div>
+        <h1>Surround Spatial Awareness</h1>
+        <p>Real-time forward vision stream paired with a continuous top-down surrounding radar view.</p>
+      </div>
+      <button id="pause" class="button">Pause capture</button>
+    </div>
+
+    <div id="notice" class="notice">Connecting to the vision pipeline…</div>
+
+    <div class="workspace">
+      <!-- PANEL 1: FORWARD VISION -->
+      <section class="panel camera-panel">
+        <div class="panel-head">
+          <div>
+            <span class="eyebrow">01 / FORWARD VISION</span>
+            <h2 id="observation-title">Camera stream</h2>
+          </div>
+          <div class="panel-controls">
+            <label class="toggle" title="Feed source selection">
+              <span class="control-label">Source:</span>
+              <select id="source-select" class="select-input" aria-label="Feed source">
+                <option value="live">Live Camera</option>
+                <option value="simulation">Synthetic Demo</option>
+                <option value="replay">Recorded Video</option>
+              </select>
+            </label>
+            <label class="toggle" title="Camera mounting orientation">
+              <span class="control-label">Rotate:</span>
+              <select id="rotate-select" class="select-input" aria-label="Camera rotation">
+                <option value="270">270° CW / 90° CCW (Mounted)</option>
+                <option value="0">0° (Raw)</option>
+                <option value="90">90° CW</option>
+                <option value="180">180°</option>
+              </select>
+            </label>
+            <label class="toggle">
+              <input id="boxes" type="checkbox" checked> YOLO detections
+            </label>
+          </div>
+        </div>
+        <div class="camera-stage">
+          <img id="stream-img" src="/stream.mjpg" hidden style="display:none;" alt="Live camera stream" crossorigin="anonymous">
+          <canvas id="camera" width="640" height="480" aria-label="Camera image with YOLO boxes and calibration points"></canvas>
+          <div class="stage-tag" id="frame-label">WAITING FOR SENSOR</div>
+        </div>
+        <div class="camera-footer">
+          <span id="resolution">—</span>
+          <span id="classes">PERSON + CHAIR DETECTOR</span>
+        </div>
+        <div class="zones-head">
+          <span>SURROUND DIRECTIONAL ZONES</span>
+          <span>Left → Right (L3…R3)</span>
+        </div>
+        <div class="zones" id="zones"></div>
+      </section>
+
+      <!-- PANEL 2: SURROUNDING VIEW -->
+      <section class="panel map-panel">
+        <div class="panel-head">
+          <div>
+            <span class="eyebrow">02 / TOP-DOWN SURROUND VIEW</span>
+            <h2 id="map-title">Surrounding radar</h2>
+          </div>
+          <span class="small-tag" id="map-badge">SURROUND RADAR</span>
+        </div>
+        <div class="map-stage">
+          <canvas id="map" width="700" height="540" aria-label="Top-down Tesla-style surround perception view"></canvas>
+        </div>
+        <div class="legend">
+          <span><i class="dot mint"></i>Person</span>
+          <span><i class="dot amber"></i>Chair / Obstacle</span>
+          <span><i class="dot outline"></i>Sensor Perimeter</span>
+        </div>
+        <p id="map-note" class="map-note">Continuous surrounding perception view. Distance and bearings update in real time.</p>
+      </section>
+    </div>
+
+    <!-- METRICS TELEMETRY -->
+    <div class="metrics">
+      <div>
+        <span>ACTIVE TARGETS</span>
+        <strong id="count">—</strong>
+        <small>Tracked in surround view</small>
+      </div>
+      <div>
+        <span>PIPELINE LATENCY</span>
+        <strong id="latency">—</strong>
+        <small id="timing-note">YOLO + Camera transfer</small>
+      </div>
+      <div>
+        <span>FRAME FRESHNESS</span>
+        <strong id="age">—</strong>
+        <small id="age-label">Since exposure</small>
+      </div>
+      <div>
+        <span>PERCEPTION MODE</span>
+        <strong id="mode-label" class="text-metric">Surround radar</strong>
+        <small id="mode-note">6-zone directional tracking</small>
+      </div>
+    </div>
+
+    <!-- GROUND-PLANE CALIBRATION -->
+    <section class="panel setup">
+      <div>
+        <span class="eyebrow">GROUND-PLANE CALIBRATION</span>
+        <h2>Metric Floor Projection (Optional)</h2>
+        <p>Project detections into physical meters using 4 measured floor corners. When uncalibrated, the surrounding view displays active directional radar bearings and proportional range.</p>
+      </div>
+      <div class="setup-actions">
+        <button class="button primary" id="calibrate">Calibrate floor</button>
+        <button class="button quiet" id="clear">Clear calibration</button>
+      </div>
+      <div id="calibration-form" hidden>
+        <p class="instruction">Capture is paused. Click four visible floor corners in order: near-left, near-right, far-right, far-left. Enter measured floor coordinates (X meters right, Y meters forward from camera).</p>
+        <div id="points"></div>
+        <div class="form-actions">
+          <button class="button primary" id="save">Apply & resume</button>
+          <button class="button" id="cancel">Cancel & resume</button>
+          <span id="calibration-message" role="status"></span>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <span>RAGging Canes / Surround Vision Lab</span>
+      <span>Continuous 60 FPS spatial rendering · YOLO real-time perception</span>
+    </footer>
+  </main>
+</body>
+</html>

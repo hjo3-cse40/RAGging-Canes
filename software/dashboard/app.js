@@ -870,7 +870,52 @@ function render() {
     }
   }
 
-  // Directional Zones Pill - shows both active now (solid) and +2s predicted (dashed)
+  // 3-Motor Haptic MVP Bar (LEFT, CENTER, RIGHT)
+  const dec = s.decision || scen?.decision;
+  const active3 = (f && f.zones_3) ? f.zones_3 : (s.zones_3 || [-1, -1, -1]);
+  const pred3 = dec?.recommended_pre_alert_zones_3 || (f && f.predicted_zones_3_2s) || s.predicted_zones_3_2s || [0, 0, 0];
+  const mProbs = dec?.motor_probabilities_3;
+  if ($('zones-3')) {
+    $('zones-3').innerHTML = active3.map((z, i) => {
+      const isPred = z === 0 && pred3 && pred3[i] === 1;
+      const cls = z === 1 ? 'active' : isPred ? 'predicted' : z === -1 ? 'unknown' : '';
+      const sym = z === 1 ? '● VIBRATE' : isPred ? '◎ PRE-ALERT' : z === -1 ? '?' : '· IDLE';
+      const probStr = Array.isArray(mProbs) && mProbs[i] != null ? ` (${Math.round(mProbs[i] * 100)}%)` : '';
+      return `
+        <div class="zone ${cls}" title="${isPred ? 'Laya/Jev 3s Pre-Alert Zone' : ''}">
+          MOTOR ${i + 1}: ${['LEFT', 'CENTER', 'RIGHT'][i]} ${sym}${probStr}
+        </div>
+      `;
+    }).join('');
+  }
+
+  const activeBackend = s.decision_backend || dec?.requested_backend || dec?.backend || 'laya';
+  if ($('decision-select') && document.activeElement !== $('decision-select')) {
+    $('decision-select').value = activeBackend;
+  }
+  if ($('decision-toggle-group')) {
+    for (const btn of $('decision-toggle-group').querySelectorAll('.decision-pill')) {
+      btn.classList.toggle('active', btn.dataset.backend === activeBackend);
+    }
+  }
+
+  if (dec) {
+    if ($('decision-model-tag')) {
+      const bLabel = dec.backend === 'laya' ? 'LAYA LOCAL' : dec.backend === 'jev' ? 'JEV API' : 'KINEMATIC';
+      $('decision-model-tag').textContent = `${bLabel} · ${Math.round((dec.confidence ?? 0.9) * 100)}% (${dec.decision_ms ?? 0}ms)`;
+    }
+    if ($('decision-text')) {
+      const note = dec.fallback_note ? ` [${dec.fallback_note}]` : '';
+      $('decision-text').textContent = `${dec.predicted_next_3s}${note}`;
+    }
+    if ($('haptic-pattern-tag')) {
+      $('haptic-pattern-tag').textContent = `PATTERN: ${(dec.haptic_pattern || 'silent').toUpperCase().replace(/_/g, ' ')}`;
+    }
+  } else if (scen && $('decision-text')) {
+    $('decision-text').textContent = scen.summary || 'Evaluating 3-keyframe trajectory…';
+  }
+
+  // 6-Sector Sub-Grid - shows both active now (solid) and +2s predicted (dashed)
   const activeZones = (f && f.zones) ? f.zones : (s.zones || [-1, -1, -1, -1, -1, -1]);
   const predZones2s = (f && f.predicted_zones_2s) ? f.predicted_zones_2s : (s.predicted_zones_2s || [0, 0, 0, 0, 0, 0]);
   $('zones').innerHTML = activeZones.map((z, i) => {
@@ -891,10 +936,11 @@ function render() {
   const procMs = f?.processing_ms ?? 0;
   const rifeMs = rifeInfo?.rife_ms ?? 0;
   const predMs = scen?.predict_ms ?? 0;
+  const decMs = dec?.decision_ms ?? 0;
   $('latency').textContent = f?.processing_ms !== undefined ? `${Math.round(procMs)} ms` : `${(rifeMs + predMs).toFixed(1)} ms`;
   $('timing-note').textContent = s.mode === 'live'
-    ? `Cam ${Math.round(f?.capture_ms ?? 0)}ms · YOLO ${Math.round(procMs)}ms · RIFE ${rifeMs.toFixed(1)}ms`
-    : `RIFE ${rifeMs.toFixed(1)}ms (${rifeInfo?.backend || 'flow'}) · 3s Pred ${predMs.toFixed(2)}ms`;
+    ? `Cam ${Math.round(f?.capture_ms ?? 0)}ms · YOLO ${Math.round(procMs)}ms · ${dec ? `${dec.backend.toUpperCase()} ${Math.round(decMs)}ms` : `RIFE ${rifeMs.toFixed(1)}ms`}`
+    : `${dec ? `${dec.backend.toUpperCase()} ${decMs}ms · ` : ''}3s Pred ${predMs.toFixed(2)}ms`;
   $('age-label').textContent = s.mode === 'live' ? 'Since exposure' : 'Since replay presentation';
   $('age').textContent = s.age_ms === null ? '—' : `${(s.age_ms / 1000).toFixed(1)} s`;
 
@@ -902,13 +948,13 @@ function render() {
   $('map-title').textContent = metric ? 'Calibrated floor map' : 'Surround radar view';
   $('map-badge').textContent = metric ? 'METRIC ESTIMATE' : 'SURROUND RADAR';
   if (scen) {
-    const zNames = ['L3', 'L2', 'L1', 'R1', 'R2', 'R3'];
-    const p2 = (scen.predicted_zones_2s || []).map((v, idx) => v === 1 ? zNames[idx] : null).filter(Boolean);
+    const zNames3 = ['LEFT', 'CENTER', 'RIGHT'];
+    const p3List = (pred3 || []).map((v, idx) => v === 1 ? zNames3[idx] : null).filter(Boolean);
     $('mode-label').textContent = scen.realistic ? (scen.min_ttc_s ? `TTC ${scen.min_ttc_s.toFixed(1)}s` : 'Realistic') : 'Filtered';
-    $('mode-note').textContent = p2.length ? `+2s Predicted Zones: ${p2.join(', ')}` : 'No obstacle zone entry in +2s';
+    $('mode-note').textContent = p3List.length ? `3-Motor Pre-Alert: ${p3List.join(' + ')}` : '3 Motors Idle [0, 0, 0]';
   } else {
     $('mode-label').textContent = metric ? 'Floor estimate' : 'Surround radar';
-    $('mode-note').textContent = metric ? 'Metric distance in meters' : '6-zone directional bearings';
+    $('mode-note').textContent = metric ? 'Metric distance in meters' : '3-motor directional haptics';
   }
 
   // Push detected objects into tracker matching displayed frame
@@ -979,6 +1025,32 @@ if ($('rife-select')) {
       message(err.message, true);
     }
   };
+}
+
+async function setDecisionBackend(backend) {
+  if (!backend) return;
+  try {
+    if ($('decision-select')) $('decision-select').value = backend;
+    if ($('decision-toggle-group')) {
+      for (const btn of $('decision-toggle-group').querySelectorAll('.decision-pill')) {
+        btn.classList.toggle('active', btn.dataset.backend === backend);
+      }
+    }
+    await post('/api/decision', { backend });
+    message(`Switched 3s decision & 3-motor haptic model to ${backend === 'jev' ? 'JEV API (TypeSafe)' : backend === 'laya' ? 'LOCAL LAYA (System-1)' : 'KINEMATIC'}.`);
+  } catch (err) {
+    message(err.message, true);
+  }
+}
+
+if ($('decision-select')) {
+  $('decision-select').onchange = e => setDecisionBackend(e.target.value);
+}
+
+if ($('decision-toggle-group')) {
+  for (const btn of $('decision-toggle-group').querySelectorAll('.decision-pill')) {
+    btn.onclick = () => setDecisionBackend(btn.dataset.backend);
+  }
 }
 
 $('source-select').onchange = async e => {

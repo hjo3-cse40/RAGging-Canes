@@ -2407,6 +2407,8 @@ class DecisionForecaster:
             "recommended_pre_alert_zones_3": zones_3,
             "recommended_pre_alert_zones": zones_6,
             "motor_probabilities_3": raw_decision.get("motor_probabilities_3", [float(v) for v in zones_3]),
+            # Preserve the observation used by this asynchronous decision.
+            "haptic_observation": scenario.get("haptic_observation"),
             "haptic_pattern": haptic_pattern,
             "confidence": raw_decision["confidence"],
             "probabilities": raw_decision["probabilities"],

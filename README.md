@@ -4,6 +4,8 @@ A wearable spatial obstacle-awareness system that turns forward camera observati
 
 See [Integration review](INTEGRATION_REVIEW.md) for model benchmarks, [DASHBOARD.md](DASHBOARD.md) for dashboard calibration and replay setup, and [HANDOFF.md](HANDOFF.md) for deployment history.
 
+For the implemented confidence-and-distance motor strength path, see [HAPTICS.md](HAPTICS.md). It adds a dedicated v2 command endpoint and ESP32 receiver/PWM adapter; deployment and physical integration remain pending.
+
 ---
 
 ## System Architecture

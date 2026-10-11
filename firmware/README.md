@@ -1,13 +1,15 @@
-# ESP32 receive-only clients
+# ESP32 motor and detection clients
 
-Choose the client matching the running backend. Both headers coexist in this repository; integrate only the selected client into the camera sketch.
+The current wearable uses three motors: left, center, right. For variable strength, follow [the haptic integration guide](../HAPTICS.md).
 
-| Backend | Client | Values | Default port |
+| Backend | Client | Output | Default port |
 | --- | --- | --- | --- |
-| YOLO | `SixZoneClient.h` | 6 | 8001 |
-| Nemotron | `ZoneClient.h` | 5 | 8000 |
+| Dashboard depth + decision pipeline | `HapticClient.h` | 3 strengths, 0–100, schema v2 | 8002 |
+| YOLO `/command?zones=3` | `ThreeZoneClient.h` | 3 binary detections | 8001 |
+| YOLO legacy | `SixZoneClient.h` | 6 binary detections | 8001 |
+| Nemotron legacy | `ZoneClient.h` | 5 binary detections | 8000 |
 
-The current motor plan uses six directions. The retained five-zone client supports the existing Nemotron setup; do not pad its output or substitute it for the six-zone contract. Neither header drives GPIO. The full camera sketch remains on the Mac attached to the ESP32.
+`HapticMotors.h` is an optional active-high PWM motor-driver adapter for `HapticClient.h`. It needs explicit pin, LEDC channel/timer, frequency and duty calibration. No motor pins are selected by default. The full working camera sketch remains on the Mac attached to the ESP32. The following sections document retained binary clients; they do not accept variable strengths.
 
 ## Six-zone YOLO client
 

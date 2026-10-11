@@ -1125,24 +1125,25 @@ function render() {
     }
   }
 
-  // 3-Motor Haptic MVP Bar (LEFT, CENTER, RIGHT)
+  // Render actual requested strength independently of binary detection/prediction flags.
   const dec = s.decision || scen?.decision;
-  const active3 = (f && f.zones_3) ? f.zones_3 : (s.zones_3 || [-1, -1, -1]);
-  const pred3 = dec?.recommended_pre_alert_zones_3 || (f && f.predicted_zones_3_2s) || s.predicted_zones_3_2s || [0, 0, 0];
-  const mem3 = (f && f.memory_zones_3) || s.memory_zones_3 || scen?.memory_zones_3 || [0, 0, 0];
-  const mProbs = dec?.motor_probabilities_3;
+  const pred3 = dec?.recommended_pre_alert_zones_3 || f?.predicted_zones_3_2s || s.predicted_zones_3_2s || [0, 0, 0];
+  const haptic = s.haptics;
   if ($('zones-3')) {
-    $('zones-3').innerHTML = active3.map((z, i) => {
-      const isPred = z === 0 && pred3 && pred3[i] === 1;
-      const isMem = z === 0 && !isPred && mem3 && mem3[i] === 1;
-      const cls = z === 1 ? 'active' : isPred ? 'predicted' : isMem ? 'memory' : z === -1 ? 'unknown' : '';
-      const sym = z === 1 ? '● VIBRATE' : isPred ? '◎ PRE-ALERT' : isMem ? '◈ MEMORY' : z === -1 ? '?' : '· IDLE';
-      const probStr = Array.isArray(mProbs) && mProbs[i] != null ? ` (${Math.round(mProbs[i] * 100)}%)` : '';
-      return `
-        <div class="zone ${cls}" title="${isPred ? 'Laya/Jev 3s Pre-Alert Zone' : isMem ? 'Remembered obstacle in BEV spatial memory' : ''}">
-          MOTOR ${i + 1}: ${['LEFT', 'CENTER', 'RIGHT'][i]} ${sym}${probStr}
-        </div>
-      `;
+    $('zones-3').innerHTML = ['LEFT', 'CENTER', 'RIGHT'].map((name, i) => {
+      const available = !offline && haptic?.valid && haptic.motor_valid_3?.[i]
+        && performance.now() - receivedAt < haptic.ttl_ms;
+      const strength = available ? Math.max(0, Math.min(100, haptic.motor_strength_3[i])) : 0;
+      const confidence = haptic?.confidence_3?.[i];
+      const distance = haptic?.distance_m_3?.[i];
+      const score = Number.isFinite(confidence) ? `${Math.round(confidence * 100)}% confidence` : 'Confidence unavailable';
+      const depth = Number.isFinite(distance) ? `${distance.toFixed(2)} m` : 'No distance';
+      return `<div class="zone ${!available ? 'unknown' : strength > 0 ? 'active' : ''}">
+        <strong>${name}: ${available ? `${strength}%` : 'UNAVAILABLE'}</strong>
+        <progress max="100" value="${strength}" aria-label="${name} requested motor strength"></progress>
+        <small>${score} · ${depth}</small>
+        <small>${haptic?.preview_only || haptic?.source_mode !== 'live' ? 'Preview only' : 'Requested strength'}</small>
+      </div>`;
     }).join('');
   }
 
@@ -1176,7 +1177,7 @@ function render() {
       $('decision-text').textContent = `${dec.predicted_next_3s}${vlmDepthNote}${note}`;
     }
     if ($('haptic-pattern-tag')) {
-      $('haptic-pattern-tag').textContent = `PATTERN: ${(dec.haptic_pattern || 'silent').toUpperCase().replace(/_/g, ' ')}`;
+      $('haptic-pattern-tag').textContent = `FORECAST: ${(dec.haptic_pattern || 'silent').toUpperCase().replace(/_/g, ' ')}`;
     }
   } else if (scen && $('decision-text')) {
     $('decision-text').textContent = scen.summary || 'Evaluating 3-keyframe trajectory…';

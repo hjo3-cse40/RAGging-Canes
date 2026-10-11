@@ -164,9 +164,9 @@ fast inference cannot compensate for a stalled JPEG transfer.
 - The actual new dashboard server ran against the camera on GX10 and published
   fresh paired images/objects. Camera errors later occurred; observations were
   invalidated and cleared. Pause/resume freshness checks passed.
-- Four dashboard tests cover ground projection, unsupported positions, invalid
+- Six dashboard tests cover ground projection, unsupported positions, invalid
   calibration, expiry, errors, in-flight pause rejection, HTTP controls, and
-  cross-origin/host rejection. The full working-tree suite passed **16 tests**
+  cross-origin/host rejection, connection reuse, and unchanged-frame responses. The full working-tree suite passed **18 tests**
   (including two earlier benchmark tests not part of this dashboard change).
 - Browser checks covered desktop and narrow layouts, replay, pause/resume, and
   the four-click calibration/apply/clear flow on synthetic input. No browser
@@ -203,14 +203,10 @@ Fresh frame IDs, current YOLO boxes, and recovery after camera timeouts were
 verified through the tunnel. JPEG transfer remains intermittent: the UI clears
 expired observations and recovers when fresh images arrive.
 
-The current launcher PID is **146038** on GX10. To stop this particular session
-and restore Nemotron, first verify the PID is still the expected launcher:
-
-```bash
-ssh asus@169.233.72.164 'ps -p 146038 -o pid,args'
-# Only if it still identifies bash tools/run_dashboard_gx10.sh:
-ssh asus@169.233.72.164 'kill -TERM 146038'
-```
+The launcher PID is saved in `dashboard-live.pid` in the GX10 deployment folder.
+To stop the session and restore Nemotron, read that file, verify its PID still
+identifies `bash tools/run_dashboard_gx10.sh`, then send that PID SIGTERM.
+Avoid reusing a PID from an earlier session.
 
 If the laptop tunnel closes, recreate it with the SSH command above. The GX10
 process was launched with nohup; it does not auto-start after a GX10 reboot.
@@ -223,3 +219,25 @@ To use it deliberately instead of GX10, stop the competing camera loop first,
 then run `.venv-dashboard/bin/python -m software.dashboard --camera-url
 http://ESP32_IP/capture --device cpu`; model weights may download on first use.
 Laptop performance has not been benchmarked.
+
+## Faster live capture
+
+Live mode now captures again immediately after processing each frame (default
+`--interval 0`). It reuses the camera HTTP connection, reconnects after failures,
+and uses a 1.5-second socket inactivity timeout. The dashboard polls at 100 ms
+and avoids retransmitting the JPEG when the frame ID has not changed. The camera
+footer reports recent successful capture FPS; transfer timing appears beside
+YOLO processing. Replay and demo retain a 0.5-second default interval.
+
+The initial 18-second persistent-connection check observed nine distinct frames,
+with the recent arrival rate around 0.47 FPS. YOLO processing was around 22 ms;
+camera transfer and intermittent connection failures limited the live rate.
+The ESP32 page advertises a stream on port 81, but that port refused connections.
+Continuous video requires a working stream endpoint from the teammate's camera
+firmware. No camera firmware, resolution, or calibration settings were changed.
+
+After the teammate was asked to send more images, a 25.1-second retest observed
+8 new frame arrivals (about 0.32 FPS). Median successful camera transfer was
+534 ms and median YOLO processing was 22 ms. Timeouts persisted. Detailed samples
+are saved locally in `artifacts/dashboard-live-retest.json`; this is an indicative
+live check, not a controlled network benchmark.

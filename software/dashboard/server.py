@@ -1,7 +1,9 @@
 """Loopback-only dashboard. Use an SSH tunnel to inspect a remote GX10."""
 import argparse
+from collections import deque
 import base64
 import io
+import http.client
 import json
 import math
 from pathlib import Path
@@ -28,6 +30,7 @@ class State:
         self.paused = False
         self.config = config
         self.generation = 0
+        self.arrivals = deque(maxlen=30)
 
     def publish(self, data, result, started, generation):
         with self.lock:
@@ -35,6 +38,7 @@ class State:
                 return
             self.frame = {**result, 'image': base64.b64encode(data).decode('ascii')}
             self.started, self.error = started, None
+            self.arrivals.append(time.monotonic())
 
     def snapshot(self):
         with self.lock:
@@ -52,6 +56,8 @@ class State:
             return {'mode': self.mode, 'status': status, 'valid': valid,
                     'error': self.error, 'age_ms': round(age*1000) if age is not None else None,
                     'max_age_ms': round(self.max_age*1000), 'frame': frame,
+                    'capture_fps': round((len(self.arrivals)-1)/(self.arrivals[-1]-self.arrivals[0]),2)
+                    if valid and len(self.arrivals)>1 and self.arrivals[-1]>self.arrivals[0] else 0,
                     'objects': objects, 'zones': frame['zones'] if valid else [-1]*6,
                     'calibration': config, 'map_mode': 'floor_estimate' if config else 'bearing_only'}
 
@@ -59,6 +65,7 @@ class State:
         with self.lock:
             self.paused = paused
             self.generation += 1
+            self.arrivals.clear()
             # A resume must wait for a newly captured frame.
             self.started = None
 
@@ -78,10 +85,40 @@ def demo_frame(index):
                              'zones':zone_states([(x,x+80)],640,[i/6 for i in range(7)])}
 
 
+class SnapshotCamera:
+    """Reuse the camera HTTP connection; reconnect only when it closes or fails."""
+    def __init__(self, url, timeout):
+        self.url=urllib.parse.urlsplit(url)
+        cls=http.client.HTTPSConnection if self.url.scheme=='https' else http.client.HTTPConnection
+        self.connection=cls(self.url.hostname,self.url.port,timeout=timeout)
+
+    def read(self):
+        query=self.url.query+('&' if self.url.query else '')+'_cb='+str(time.time_ns())
+        path=urllib.parse.urlunsplit(('', '', self.url.path or '/', query, ''))
+        try:
+            self.connection.request('GET',path,headers={'Cache-Control':'no-cache'})
+            response=self.connection.getresponse()
+            if response.status != 200:
+                raise OSError(f'Camera HTTP {response.status}')
+            data=response.read(MAX_BYTES+1)
+            if len(data)>MAX_BYTES:
+                raise ValueError('Camera JPEG exceeds the size limit')
+            response.close()
+            return data
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        self.connection.close()
+
+
 def run_source(state, args, stop):
     pipeline = None
+    camera = None
     try:
         if args.camera_url:
+            camera=SnapshotCamera(args.camera_url,args.timeout)
             pipeline = Pipeline(args.output/'yolo', detect=True, model=args.model, device=args.device, max_result_age_ms=args.max_age*1000)
         replay = []
         if args.replay:
@@ -102,13 +139,12 @@ def run_source(state, args, stop):
             with state.lock:
                 paused, generation = state.paused, state.generation
             if paused:
+                if camera: camera.close()
                 stop.wait(.1);continue
             started = time.monotonic()
             try:
                 if args.camera_url:
-                    sep='&' if '?' in args.camera_url else '?'
-                    with urllib.request.urlopen(args.camera_url+sep+'_cb='+str(time.time_ns()),timeout=args.timeout) as r:
-                        raw=r.read(MAX_BYTES+1)
+                    raw=camera.read()
                     image=decode_jpeg(raw)
                     if args.rotate:
                         image=image.rotate(-args.rotate,expand=True)
@@ -127,13 +163,17 @@ def run_source(state, args, stop):
             except Exception as exc:
                 with state.lock:
                     if generation == state.generation: state.error=str(exc)
-            stop.wait(args.interval)
+            # Retry failed transfers without a tight reconnect loop.
+            stop.wait(max(args.interval, .1) if state.error else args.interval)
     except Exception as exc:
         with state.lock: state.error=str(exc)
+    finally:
+        if camera: camera.close()
 
 
 def handler_for(state):
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
         def log_message(self,*args): pass
 
         def send(self, status, body, mime='application/json'):
@@ -157,7 +197,12 @@ def handler_for(state):
         def do_GET(self):
             if not self.allowed(): return
             path=urllib.parse.urlsplit(self.path).path
-            if path=='/api/state': return self.send(200,state.snapshot())
+            if path=='/api/state':
+                snapshot=state.snapshot()
+                after=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('after',[None])[0]
+                if snapshot['frame'] and after == str(snapshot['frame']['frame_id']):
+                    snapshot['frame'].pop('image',None)
+                return self.send(200,snapshot)
             files={'/':('index.html','text/html'),'/app.js':('app.js','text/javascript'),'/style.css':('style.css','text/css')}
             if path in files:
                 file,mime=files[path];return self.send(200,(STATIC/file).read_bytes(),mime)
@@ -197,13 +242,15 @@ def main():
     p.add_argument('--port',type=int,default=8080)
     p.add_argument('--model',default='yolo26n.pt');p.add_argument('--device',default='0')
     p.add_argument('--rotate',type=int,choices=[0,90,180,270],default=0,help='Clockwise rotation before detection')
-    p.add_argument('--interval',type=float,default=.5);p.add_argument('--timeout',type=float,default=3)
+    p.add_argument('--interval',type=float,default=None,help='Delay after each frame; live defaults to 0, replay/demo to 0.5 s')
+    p.add_argument('--timeout',type=float,default=1.5,help='Camera socket inactivity timeout in seconds')
     p.add_argument('--max-age',type=float,default=2.5)
     p.add_argument('--output',type=Path,default=Path('artifacts/dashboard'))
     p.add_argument('--calibration',type=Path,help='Explicitly reuse a calibration for the same fixed camera pose')
     args=p.parse_args()
+    if args.interval is None: args.interval=0 if args.camera_url else .5
     if (not 1 <= args.port <= 65535 or not all(math.isfinite(v) for v in (args.interval,args.timeout,args.max_age))
-            or args.interval < .05 or args.timeout <= 0 or args.max_age <= 0):
+            or args.interval < 0 or args.timeout <= 0 or args.max_age <= 0):
         p.error('Invalid port or timing settings.')
     if args.camera_url and urllib.parse.urlsplit(args.camera_url).scheme not in ('http','https'):
         p.error('Camera URL must use HTTP or HTTPS.')

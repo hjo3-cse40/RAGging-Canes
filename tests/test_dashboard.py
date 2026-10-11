@@ -1,15 +1,16 @@
 import json
+import http.client
 import tempfile
 import threading
 import time
 import unittest
 import urllib.request
 import urllib.error
-from http.server import ThreadingHTTPServer
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 from software.dashboard.geometry import calibration, project
-from software.dashboard.server import State, handler_for
+from software.dashboard.server import State, handler_for, SnapshotCamera
 
 
 def config():
@@ -47,6 +48,54 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(state.snapshot()['valid'])
         state.publish(b'new',frame,time.monotonic(),2)
         self.assertTrue(state.snapshot()['valid'])
+
+    def test_camera_reuses_connection_and_recovers_after_http_failure(self):
+        class Camera(BaseHTTPRequestHandler):
+            protocol_version='HTTP/1.1'
+            calls=0
+            def log_message(self,*args):pass
+            def do_GET(self):
+                Camera.calls+=1
+                body=b'jpeg'
+                self.send_response(503 if Camera.calls==3 else 200)
+                self.send_header('Content-Length',str(len(body)));self.end_headers()
+                self.wfile.write(body)
+        server=ThreadingHTTPServer(('127.0.0.1',0),Camera)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        camera=SnapshotCamera(f'http://127.0.0.1:{server.server_port}/capture?size=vga',1)
+        try:
+            self.assertEqual(camera.read(),b'jpeg')
+            socket=camera.connection.sock
+            self.assertEqual(camera.read(),b'jpeg')
+            self.assertIs(camera.connection.sock,socket)
+            with self.assertRaises(OSError):camera.read()
+            self.assertIsNone(camera.connection.sock)
+            self.assertEqual(camera.read(),b'jpeg')
+        finally:
+            camera.close();server.shutdown();server.server_close();thread.join()
+
+    def test_unchanged_frame_omits_image_and_reuses_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state=State('live',directory)
+            state.publish(b'jpeg',{'frame_id':7,'width':640,'height':480,
+                                  'zones':[0]*6,'objects':[]},time.monotonic(),0)
+            server=ThreadingHTTPServer(('127.0.0.1',0),handler_for(state))
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            client=http.client.HTTPConnection('127.0.0.1',server.server_port)
+            try:
+                client.request('GET','/api/state?after=6')
+                first=json.loads(client.getresponse().read())
+                self.assertIn('image',first['frame'])
+                connection=client.sock
+                client.request('GET','/api/state?after=7')
+                second=json.loads(client.getresponse().read())
+                self.assertIs(client.sock,connection)
+                self.assertNotIn('image',second['frame'])
+                self.assertEqual(second['frame']['frame_id'],7)
+                client.request('GET','/api/state')
+                self.assertIn('image',json.loads(client.getresponse().read())['frame'])
+            finally:
+                client.close();server.shutdown();server.server_close();thread.join()
 
     def test_http_controls_calibration_and_origin_checks(self):
         with tempfile.TemporaryDirectory() as directory:

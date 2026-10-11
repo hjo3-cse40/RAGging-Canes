@@ -10,7 +10,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 from software.dashboard.geometry import calibration, project
-from software.dashboard.server import State, handler_for, SnapshotCamera
+from software.dashboard.server import State, handler_for, SnapshotCamera, StreamCamera, LatestFrameBuffer, create_camera
 
 
 def config():
@@ -48,6 +48,32 @@ class DashboardTests(unittest.TestCase):
         self.assertFalse(state.snapshot()['valid'])
         state.publish(b'new',frame,time.monotonic(),2)
         self.assertTrue(state.snapshot()['valid'])
+
+    def test_state_rotation_and_setting(self):
+        state = State('live', Path('/tmp'), rotate=90)
+        self.assertEqual(state.snapshot()['rotate'], 90)
+        state.set_rotate(180)
+        self.assertEqual(state.snapshot()['rotate'], 180)
+        state.set_rotate(0)
+        self.assertEqual(state.snapshot()['rotate'], 0)
+        with self.assertRaises(ValueError):
+            state.set_rotate(45)
+
+    def test_state_mode_switching(self):
+        state = State('live', Path('/tmp'), rotate=270)
+        self.assertEqual(state.snapshot()['mode'], 'live')
+        state.set_mode('simulation')
+        self.assertEqual(state.snapshot()['mode'], 'simulation')
+        self.assertEqual(state.snapshot()['rotate'], 0)
+        state.set_mode('replay')
+        self.assertEqual(state.snapshot()['mode'], 'replay')
+        self.assertEqual(state.snapshot()['rotate'], 0)
+        state.set_mode('live')
+        self.assertEqual(state.snapshot()['mode'], 'live')
+        self.assertEqual(state.snapshot()['rotate'], 270)
+        with self.assertRaises(ValueError):
+            state.set_mode('invalid_mode')
+
 
     def test_camera_reuses_connection_and_recovers_after_http_failure(self):
         class Camera(BaseHTTPRequestHandler):
@@ -120,6 +146,99 @@ class DashboardTests(unittest.TestCase):
                 with post('/api/calibration',{'clear':True}):pass
                 self.assertIsNone(state.config)
             finally:server.shutdown();server.server_close();thread.join()
+
+    def test_decoupled_latest_frame_buffer_drops_stale_and_gets_freshest(self):
+        buf = LatestFrameBuffer()
+        buf.put(b'frame1', 100.0)
+        buf.put(b'frame2', 101.0)
+        buf.put(b'frame3', 102.0)
+        item, ts, gen = buf.get(None)
+        self.assertEqual(item, b'frame3')
+        self.assertEqual(ts, 102.0)
+        self.assertEqual(gen, 3)
+        # Waiting for newer when no new arrives returns None
+        item_none, _, same_gen = buf.get(gen, timeout=0.05)
+        self.assertIsNone(item_none)
+        self.assertEqual(same_gen, 3)
+        # Pushing new wakes and returns new
+        buf.put(b'frame4', 103.0)
+        item_new, _, new_gen = buf.get(gen, timeout=0.1)
+        self.assertEqual(item_new, b'frame4')
+        self.assertEqual(new_gen, 4)
+        buf.close()
+
+    def test_stream_camera_ingests_mjpeg_multipart_stream(self):
+        frame_jpeg = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\xff\xd9'
+        class MJPEGHandler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def log_message(self, *args): pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+                self.end_headers()
+                for _ in range(3):
+                    chunk = b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + str(len(frame_jpeg)).encode() + b'\r\n\r\n' + frame_jpeg + b'\r\n'
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    time.sleep(0.01)
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), MJPEGHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cam = StreamCamera(f'http://127.0.0.1:{server.server_port}/stream', timeout=1.0)
+        try:
+            f1 = cam.read()
+            self.assertEqual(f1, frame_jpeg)
+            f2 = cam.read()
+            self.assertEqual(f2, frame_jpeg)
+        finally:
+            cam.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_stream_mjpg_server_endpoint_broadcasts_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State('live', directory)
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(state))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            frame_jpeg = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00C\x00\xff\xd9'
+            url = f'http://127.0.0.1:{server.server_port}'
+            stream_cam = StreamCamera(f'{url}/stream.mjpg', timeout=2.0)
+            try:
+                # Publish a frame to state
+                state.publish(frame_jpeg, {'frame_id': 1, 'width': 640, 'height': 480, 'zones': [0]*6, 'objects': []}, time.monotonic(), 0)
+                got = stream_cam.read()
+                self.assertEqual(got, frame_jpeg)
+            finally:
+                stream_cam.close()
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    def test_meta_only_state_polling_omits_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State('live', directory)
+            state.publish(b'jpeg', {'frame_id': 10, 'width': 640, 'height': 480, 'zones': [0]*6, 'objects': []}, time.monotonic(), 0)
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(state))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = f'http://127.0.0.1:{server.server_port}'
+            try:
+                # Regular polling includes image
+                with urllib.request.urlopen(f'{url}/api/state') as r:
+                    full = json.loads(r.read())
+                    self.assertIn('image', full['frame'])
+                # Meta-only polling omits image
+                with urllib.request.urlopen(f'{url}/api/state?meta_only=1') as r:
+                    compact = json.loads(r.read())
+                    self.assertNotIn('image', compact['frame'])
+                    self.assertEqual(compact['frame']['frame_id'], 10)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 
 if __name__=='__main__':unittest.main()

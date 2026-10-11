@@ -1,6 +1,48 @@
-# Continuation memory — October 10, 2026
+# Continuation memory — October 11, 2026
+
+## Latest remote Tailscale & home ESP32 camera update (October 11, 2026)
+
+- **Active branch:** `seamless-video-stream` (includes continuous MJPEG `/stream.mjpg` broadcaster, `StreamCamera`, `LatestFrameBuffer`, and Tesla-style surround view dashboard UI).
+- **Tailscale & GX10 access:** User has Tailscale active on this Mac (`100.124.89.28`) and is connected via SSH to the GX10 over Tailscale (`asus@100.83.88.47`, replacing the hackathon LAN IP `169.233.72.164`).
+- **Home ESP32 camera state:** Teammate has the ESP32 camera at his home on his local Wi-Fi at **`10.0.0.117`** (replacing the hackathon LAN IP `169.233.72.178`). Because `10.0.0.117` is a private RFC 1918 home LAN address (and collides with the user's own `10.0.0.0/24` home Wi-Fi subnet at `10.0.0.163`), it cannot be reached directly from outside the teammate's house without a tunnel.
+- **Teammate onboarding & camera tunnel:**
+  - User requested the teammate's public SSH key (`~/.ssh/id_ed25519.pub`) to append to `~/.ssh/authorized_keys` on the GX10, and shared Tailscale setup instructions so teammates can also SSH into `asus@100.83.88.47`.
+  - Once the teammate connects via SSH with reverse port forwarding:
+    `ssh -L 8080:127.0.0.1:8080 -R 8117:10.0.0.117:80 asus@100.83.88.47`
+    his home ESP32 (`10.0.0.117:80`) is exposed directly on the GX10 at **`http://127.0.0.1:8117/capture`** (or via a temporary public tunnel `ssh -R 80:10.0.0.117:80 nokey@localhost.run`), and both can view the live YOLO dashboard on port `8080`.
+
+## Latest dashboard continuation — supersedes historical service state below
+
+Saved at the user's explicit request after testing the live dashboard.
+
+- User chose **YOLO for now**, asked for a new branch, and requested a runnable camera + bird's-eye dashboard. Branch: `codex/yolo-birdseye-dashboard`; dashboard commits: `00b16c5` (initial implementation), `ae09cf2` (faster capture/update cadence). No dashboard push was requested or performed.
+- Camera physical mount is 90° clockwise. Auto-rotation default is set to 270° clockwise (90° counter-clockwise correction) in `software.dashboard` and `software.vision`, transforming raw landscape frames into upright portrait views before YOLO inference and 6-sector mapping. Orientation can also be toggled live via the dashboard UI dropdown or `POST /api/rotate`.
+- Dashboard: **http://127.0.0.1:8080/** through a laptop SSH tunnel to GX10 loopback port 8080. User explicitly requested leaving it running for live viewing. Verify existing processes/tunnel before launching replacements; avoid competing camera consumers.
+- Isolated GX10 deployment: `/home/asus/RAGging-Canes/artifacts/yolo-dashboard-20261010`; GPU Python `/home/asus/RAGging-Canes/.venv/bin/python`; model `/home/asus/RAGging-Canes/yolo26n.pt`. Launcher `tools/run_dashboard_gx10.sh`; current active process is PID 62196 running in tmux session `dashboard` with `--rotate 270`. Logs: `dashboard-live.log`; output: `artifacts/live/`.
+- **Nemotron PID 87164 is intentionally SIGSTOP-paused while the dashboard runs.** The wrapper restores it with SIGCONT when stopped and terminates its dashboard child. Preserve both existing GX10 checkouts.
+- Tunnel command: `ssh -N -L 127.0.0.1:8080:127.0.0.1:8080 -o ExitOnForwardFailure=yes -o ConnectTimeout=8 -o ControlPath=none -o ServerAliveInterval=15 -o ServerAliveCountMax=3 asus@169.233.72.164`. It was active at save time; recheck in future sessions.
+- Live capture now requests the next frame immediately (`--interval 0.04`), reuses the camera HTTP connection, reconnects after failures, and uses a 3.5-second socket inactivity timeout. Browser polls every 80 ms; unchanged frame responses omit the JPEG. UI shows capture FPS and camera transfer timing alongside YOLO processing.
+- Verified live upright stream: frames returning `status: live`, `valid: true`, `rotate: 270`, with active upright detections of people and chairs across the room.
+- Camera snapshot URL remains `http://169.233.72.178/capture`. Standard ESP32 page advertises `http://169.233.72.178:81/stream`, but port 81 refused connections from laptop and GX10. Next useful step: get the teammate's working continuous stream endpoint or full camera sketch to investigate streaming. No firmware, camera resolution, or camera quality changes were made.
+- Mapping uses four-point floor homography, bounding-box bottom centers, fixed camera, and flat floor. Before calibration, UI shows directions without range. No depth sensing, camera pose tracking, persistent world map, or sensor fusion is implemented. No physical floor calibration had been saved at the last check; recheck before restarting and preserve `artifacts/live/calibration.json`. Do not interrupt paused calibration.
+- Full regression suite passing. Dashboard checks cover calibration/projection, unsupported positions, expiry/error clearing, pause generations, HTTP controls/origin checks, rotation state/API setting, connection reuse/recovery, and unchanged-frame responses.
+- Reference: `DASHBOARD.md` for run commands, architecture, floor calibration, and test conditions. Verified frame artifact: `artifacts/dashboard-live-verified.jpg`.
+- Earlier model evaluation: 46 images (40 captures plus 6 upright derivatives), 414 inference calls. YOLO repeatability 46/46; Nemotron 29/46 at temperature 0 and 30/46 at 0.1 with thinking off. Median YOLO ~24 ms versus Nemotron ~756 ms. User chose YOLO. See `CAMERA_EVALUATION.md` and local evaluation artifacts; these are sample measurements, not validated detection accuracy.
+- Preserve unrelated uncommitted benchmark/handoff changes: `software/README.md`, `software/compare_models.py`, `CAMERA_EVALUATION.md`, `software/evaluate_camera.py`, `tests/test_evaluate_camera.py`, and `tools/render_camera_review.py`. This memory update is local and uncommitted. Do not discard work or repeat previous setup.
+
 
 ## Latest integration state
+
+**Published and verified:** GitHub `main` is at `2d49008285cdafbff621eb2a376d55405ac2ff61` (`2d49008`, merge commit). It preserves teammate commit `482528f` and local implementation checkpoint `798c8de`. The user explicitly approved pushing; the push succeeded and the remote branch hash was verified. The working tree was clean afterward. This memory update is a subsequent local documentation edit.
+
+- User preference: **do not add ChatGPT/AI co-author attribution or similar credit to commits**. Both published commits use the existing Git identity and contain no co-author trailers.
+- All **10 combined tests passed** in the merged checkout. CLI help for both services and the comparison runner, local documentation links, and staged whitespace checks passed.
+- Both backends coexist unchanged: Nemotron uses `gx10.service`, port 8000, five zones, and `firmware/ZoneClient.h`; YOLO uses `software.vision`, port 8001, six zones, and `firmware/SixZoneClient.h`. They are not interchangeable at the firmware protocol level. Six-zone Nemotron prompting is currently a comparison-runner option only.
+- Shared README, firmware instructions, and ignore patterns were reconciled. Detailed Nemotron setup is preserved in `gx10/README.md`; model measurements and repeatable testing are in `INTEGRATION_REVIEW.md` and `software/compare_models.py`.
+- Teammates with clean checkouts can run `git pull --ff-only`. Existing GX10 deployments have uncommitted work and must be inspected/preserved before updating; publishing source did not update or restart them.
+- No firmware was flashed, no motor mapping was supplied, and no persistent YOLO endpoint was activated. The last GX10 check confirmed the original Nemotron process restored/running and port 8001 closed.
+- Approval review blocked camera-image/log downloads; the separate approval question was not answered. Source/test copying to the isolated GX10 review directory was explicitly approved and completed. Do not treat source-copy approval as image-download approval.
+- Next work: obtain the full camera sketch and motor/driver mapping; choose the active backend for hardware testing; if both must support the six-motor client, implement and test a shared six-zone protected command contract. Camera reliability and labeled detection coverage still need validation. Read the historical deployment details below before changing running services.
 
 At the user’s request, the local six-zone implementation and teammate commit `482528f` have been combined in one repository. Use the root README for current setup and `gx10/README.md` for the retained Nemotron backend. Both clients and both test suites are present. The deployment paths and earlier no-merge statements below are historical; no remote running service was changed by this source merge.
 

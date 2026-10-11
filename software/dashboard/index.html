@@ -50,6 +50,15 @@
                 <option value="replay">Recorded Video</option>
               </select>
             </label>
+            <label class="toggle" title="ESP32 persistent stream & sensor resolution">
+              <span class="control-label">Stream:</span>
+              <select id="camera-res-select" class="select-input" aria-label="ESP32 stream resolution">
+                <option value="320x240" selected>320×240 QVGA Stream (~50ms)</option>
+                <option value="400x296">400×296 CIF Stream</option>
+                <option value="480x320">480×320 HVGA Stream</option>
+                <option value="640x480">640×480 VGA</option>
+              </select>
+            </label>
             <label class="toggle" title="Camera mounting orientation">
               <span class="control-label">Rotate:</span>
               <select id="rotate-select" class="select-input" aria-label="Camera rotation">

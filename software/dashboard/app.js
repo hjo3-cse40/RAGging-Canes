@@ -1299,6 +1299,19 @@ async function poll() {
 $('boxes').onchange = () => {};
 if ($('forecast')) $('forecast').onchange = () => {};
 
+if ($('camera-res-select')) {
+  $('camera-res-select').onchange = async e => {
+    const resolution = e.target.value;
+    try {
+      const res = await post('/api/camera', { resolution, stream_mode: 'auto' });
+      priorFrame = null;
+      message(`Configured ESP32 persistent stream to ${res.camera_resolution} (quality ${res.camera_quality}).`);
+    } catch (err) {
+      message(err.message, true);
+    }
+  };
+}
+
 if ($('rife-select')) {
   $('rife-select').onchange = async e => {
     const factor = parseInt(e.target.value, 10);

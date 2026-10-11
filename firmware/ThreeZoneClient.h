@@ -10,7 +10,7 @@
 class ThreeZoneClient {
  public:
   explicit ThreeZoneClient(const char* commandUrl, const char* bearerToken = nullptr,
-                           uint32_t pollIntervalMs = 200, uint32_t httpTimeoutMs = 900)
+                           uint32_t pollIntervalMs = 80, uint32_t httpTimeoutMs = 600)
       : commandUrl_(commandUrl),
         bearerToken_(bearerToken),
         pollIntervalMs_(pollIntervalMs),
@@ -55,16 +55,19 @@ class ThreeZoneClient {
   }
 
   void run() {
+    WiFiClient client;
+    HTTPClient http;
+    http.setReuse(true);
     for (;;) {
       if (WiFi.status() != WL_CONNECTED) {
         invalidate("wifi");
         vTaskDelay(pdMS_TO_TICKS(pollIntervalMs_));
         continue;
       }
-      HTTPClient http;
+      client.setNoDelay(true);
       const uint32_t started = millis();
       http.setTimeout(httpTimeoutMs_);
-      if (!http.begin(commandUrl_)) {
+      if (!http.begin(client, commandUrl_)) {
         invalidate("begin");
         vTaskDelay(pdMS_TO_TICKS(pollIntervalMs_));
         continue;
@@ -74,10 +77,10 @@ class ThreeZoneClient {
       }
       const int status = http.GET();
       const String payload = status == 200 ? http.getString() : String();
-      http.end();
       const uint32_t rtt = millis() - started;
 
       if (status != 200) {
+        http.end();
         invalidate("http");
         vTaskDelay(pdMS_TO_TICKS(pollIntervalMs_));
         continue;

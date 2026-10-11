@@ -1,13 +1,49 @@
-# ESP32 receive-only clients
+# ESP32 camera streaming & receive-only clients
 
-Choose the client matching the running backend. Both headers coexist in this repository; integrate only the selected client into the camera sketch.
+Choose the client matching the running backend. All headers coexist in this repository; integrate only the selected headers into the camera sketch.
 
-| Backend | Client | Values | Default port |
+| Component / Backend | Header | Values / Role | Default port / Path |
 | --- | --- | --- | --- |
-| YOLO | `SixZoneClient.h` | 6 | 8001 |
-| Nemotron | `ZoneClient.h` | 5 | 8000 |
+| **Low-Latency 320×240 Stream** | `FastStreamServer.h` | Persistent MJPEG (`/stream`) + Binary WebSocket (`/ws`) at `FRAMESIZE_QVGA` | `80` (`/stream`, `/ws`, `/capture`, `/control`) & `81` |
+| **3-Motor Wearable MVP (YOLO + Laya/Jev)** | `ThreeZoneClient.h` | 3 (`[Left, Center, Right]`) | `8001` (`/command?zones=3`) |
+| **6-Zone YOLO Client** | `SixZoneClient.h` | 6 (`[L3..R3]`) | `8001` (`/command`) |
+| **5-Zone Nemotron Client** | `ZoneClient.h` | 5 | `8000` (`/command`) |
 
-The current motor plan uses six directions. The retained five-zone client supports the existing Nemotron setup; do not pad its output or substitute it for the six-zone contract. Neither header drives GPIO. The full camera sketch remains on the Mac attached to the ESP32.
+---
+
+## Low-Latency 320×240 (QVGA) Persistent MJPEG / WebSocket Stream (`FastStreamServer.h`)
+
+`FastStreamServer.h` eliminates the ~550–700 ms per-frame HTTP `/capture` bottleneck and achieves **~45–85 ms frame delivery (~12–20 FPS)** by combining:
+1. **`FRAMESIZE_QVGA` (`320×240`) + `jpeg_quality = 14`** (~4–7 KB per JPEG vs ~35 KB at VGA).
+2. **`CAMERA_GRAB_LATEST` + 2 PSRAM framebuffers** so `esp_camera_fb_get()` always returns the newest exposure instead of a queued frame.
+3. **`WiFi.setSleep(false)` (`WIFI_PS_NONE`)** to prevent ESP32 Wi-Fi modem sleep from adding 100–300 ms DTIM beacon delays.
+4. **Persistent `GET /stream` (Multipart MJPEG) and `GET /ws` (RFC 6455 Binary WebSocket)** with `TCP_NODELAY` on port `80` (and port `81`), allowing single-port SSH tunnels (`-R 8117:ESP32_IP:80`) to stream continuously.
+
+### Option A: Drop-in with existing `startCameraServer()` sketch
+If your sketch already calls `startCameraServer()`, simply call `FastStreamServer::optimizeLiveSensor()` after `esp_camera_init()` and `WiFi.begin()`:
+
+```cpp
+#include "FastStreamServer.h"
+#include "ThreeZoneClient.h"
+
+// Before esp_camera_init(&config):
+FastStreamServer::applyLowLatencyConfig(config, FRAMESIZE_QVGA, 14);
+
+// In setup(), after WiFi is connected and camera is initialized:
+FastStreamServer::optimizeLiveSensor(FRAMESIZE_QVGA, 14);
+```
+
+### Option B: Replace `startCameraServer()` with `FastStreamServer` (exposes `/stream` and `/ws` on port 80)
+
+```cpp
+#include "FastStreamServer.h"
+FastStreamServer streamServer(80, 81);
+
+// In setup() after esp_camera_init() and WiFi connection:
+streamServer.begin(FRAMESIZE_QVGA, 14);
+```
+
+---
 
 ## Six-zone YOLO client
 

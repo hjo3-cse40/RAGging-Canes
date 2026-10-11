@@ -293,13 +293,112 @@ class DashboardTests(unittest.TestCase):
                 res_dec = post('/api/decision', {'backend': 'gemma4:26b'})
                 self.assertTrue(res_dec['ok'])
                 self.assertEqual(state.decision_forecaster.requested_backend, 'gemma4:26b')
+
+                res_cam = post('/api/camera', {'resolution': '320x240', 'quality': 14, 'stream_mode': 'mjpeg'})
+                self.assertTrue(res_cam['ok'])
+                self.assertEqual(res_cam['camera_resolution'], '320x240')
+                self.assertEqual(res_cam['camera_quality'], 14)
+                self.assertEqual(res_cam['stream_mode'], 'mjpeg')
             finally:
                 state.decision_forecaster.stop()
                 server.shutdown()
                 server.server_close()
                 thread.join()
 
+    def test_low_latency_stream_camera_read_latest_and_websocket_and_esp32_control(self):
+        from software.dashboard.server import WebSocketCamera, configure_esp32_camera
+        import hashlib, base64, socket as sock_mod
+
+        f1 = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\x01\xff\xd9'
+        f2 = b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\x02\xff\xd9'
+        control_calls = []
+
+        class FastESP32Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def log_message(self, *args): pass
+            def do_GET(self):
+                if self.path.startswith('/control'):
+                    control_calls.append(self.path)
+                    body = b'{"ok":true}'
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.startswith('/stream'):
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+                    self.end_headers()
+                    # Send two frames back-to-back in a single write so read_latest skips f1 and returns f2
+                    burst = (
+                        b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + str(len(f1)).encode() + b'\r\n\r\n' + f1 + b'\r\n' +
+                        b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + str(len(f2)).encode() + b'\r\n\r\n' + f2 + b'\r\n'
+                    )
+                    self.wfile.write(burst)
+                    self.wfile.flush()
+                    time.sleep(0.05)
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), FastESP32Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f'http://127.0.0.1:{server.server_port}'
+        try:
+            cfg = configure_esp32_camera(f'{base}/capture', resolution='320x240', quality=14)
+            self.assertTrue(cfg['ok'])
+            self.assertEqual(cfg['framesize'], 5)
+            self.assertEqual(len(control_calls), 2)
+
+            cam = create_camera(f'{base}/capture', timeout=1.0, is_stream='auto')
+            self.assertIsInstance(cam, StreamCamera)
+            latest = cam.read_latest()
+            self.assertEqual(latest, f2)
+            cam.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+        # Test RFC 6455 Binary WebSocketCamera (/ws)
+        ws_srv = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+        ws_srv.bind(('127.0.0.1', 0))
+        ws_srv.listen(1)
+        ws_port = ws_srv.getsockname()[1]
+
+        def ws_worker():
+            conn, _ = ws_srv.accept()
+            try:
+                req = conn.recv(4096).decode('latin1')
+                key = ''
+                for line in req.splitlines():
+                    if line.lower().startswith('sec-websocket-key:'):
+                        key = line.split(':', 1)[1].strip()
+                accept = base64.b64encode(
+                    hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')).digest()
+                ).decode('ascii')
+                resp = (
+                    'HTTP/1.1 101 Switching Protocols\r\n'
+                    'Upgrade: websocket\r\n'
+                    'Connection: Upgrade\r\n'
+                    f'Sec-WebSocket-Accept: {accept}\r\n\r\n'
+                ).encode('ascii')
+                conn.sendall(resp)
+                # Send binary WebSocket frame (0x82) containing f2
+                conn.sendall(bytes([0x82, len(f2)]) + f2)
+                time.sleep(0.05)
+            finally:
+                conn.close()
+                ws_srv.close()
+
+        ws_t = threading.Thread(target=ws_worker, daemon=True)
+        ws_t.start()
+        ws_cam = WebSocketCamera(f'ws://127.0.0.1:{ws_port}/ws', timeout=1.0)
+        try:
+            self.assertEqual(ws_cam.read_latest(), f2)
+        finally:
+            ws_cam.close()
+            ws_t.join(timeout=1.0)
+
 
 if __name__=='__main__':unittest.main()
+
 
 

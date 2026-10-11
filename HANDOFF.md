@@ -1,5 +1,17 @@
 # Continuation memory — October 11, 2026
 
+## Latest low-latency 320×240 (QVGA) persistent MJPEG / WebSocket stream update (October 11, 2026)
+
+- **Branch & status:** Implemented on `feat/esp32-low-latency-stream` and shipped to `main`. All 37 unit and integration tests pass.
+- **Firmware stream server (`firmware/FastStreamServer.h` & `firmware/ThreeZoneClient.h`):**
+  - Added header-only `FastStreamServer` supporting persistent multipart MJPEG (`GET /stream`) and RFC 6455 binary WebSocket (`GET /ws`) on port 80 and port 81 with `TCP_NODELAY`, `FRAMESIZE_QVGA` (`320×240`), `jpeg_quality = 14`, `CAMERA_GRAB_LATEST` (2 PSRAM framebuffers), and `WiFi.setSleep(false)` (`WIFI_PS_NONE`).
+  - Updated `ThreeZoneClient.h` to reuse a persistent `WiFiClient` with `setNoDelay(true)` and an 80 ms polling cadence.
+- **Dashboard & vision persistent stream reader (`software/dashboard/server.py` & `software/vision.py`):**
+  - Added `configure_esp32_camera()` to automatically configure `framesize=5` (`320×240` QVGA) and `quality=14` via `/control` on startup and whenever the ESP32 reconnects to Wi-Fi.
+  - Upgraded `StreamCamera` (`read_latest()` non-blocking socket burst drain + `TCP_NODELAY`), added `WebSocketCamera` (`ws://.../ws` binary stream), removed the 50 ms producer loop sleep on persistent streams, and added live `POST /api/camera` resolution/stream switching (`#camera-res-select` in the dashboard UI).
+  - Updated `Pipeline.process()` to dynamically run YOLO at `imgsz=320` on `320×240` inputs.
+- **GX10 deployment:** Synced to `/home/asus/RAGging-Canes` on `asus@169.233.72.164` and restarted on port `8080` with local SSH tunnel active at `http://127.0.0.1:8080`.
+
 ## Latest remote Tailscale & home ESP32 camera update (October 11, 2026)
 
 - **Active branch:** `seamless-video-stream` (includes continuous MJPEG `/stream.mjpg` broadcaster, `StreamCamera`, `LatestFrameBuffer`, and Tesla-style surround view dashboard UI).

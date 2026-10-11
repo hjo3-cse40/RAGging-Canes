@@ -14,9 +14,21 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageDraw
-from software.vision import Pipeline, MAX_BYTES, decode_jpeg, zone_states
+from software.vision import (
+    DEFAULT_OBSTACLE_CLASSES,
+    GX10_DETECTOR_MODELS,
+    OBSTACLE_CLASS_PRESETS,
+    Pipeline,
+    MAX_BYTES,
+    decode_jpeg,
+    resolve_classes,
+    resolve_detector_model,
+    zone_states,
+)
 from software.predictor import (
     DecisionForecaster,
+    GX10_OLLAMA_MODELS,
+    MonocularDepthEstimator,
     RIFEInterpolator,
     TrajectoryPredictor,
     six_to_three_zones,
@@ -83,7 +95,9 @@ class StreamBroadcaster:
 class State:
     def __init__(self, mode, output, max_age=2.5, config=None, rotate=0,
                  rife_factor=0, device='auto', decision_backend='laya',
-                 jev_key_file='private/jev_api_key.txt', start_decision_worker=False):
+                 jev_key_file='private/jev_api_key.txt', start_decision_worker=False,
+                 memory_ttl_s=12.0, depth_mode='auto', classes_spec='indoor_nav',
+                 model_spec='auto', ollama_url='http://127.0.0.1:11434'):
         self.lock = threading.Lock()
         self.mode, self.output, self.max_age = mode, Path(output), max_age
         self.rotate = rotate
@@ -93,15 +107,41 @@ class State:
         self.paused = False
         self.config = config
         self.generation = 0
+        self.classes_spec = classes_spec if classes_spec else 'indoor_nav'
+        self.model_spec = str(model_spec or 'auto').strip()
         self.arrivals = deque(maxlen=30)
         self.stream_arrivals = deque(maxlen=90)
         self.broadcaster = StreamBroadcaster()
-        self.predictor = TrajectoryPredictor()
+        self.predictor = TrajectoryPredictor(memory_ttl_s=memory_ttl_s)
+        self.depth_estimator = MonocularDepthEstimator(mode=depth_mode, device=device)
         self.interpolator = RIFEInterpolator(factor=rife_factor, device=device)
+
+        def _on_vlm_depth_cal(cal):
+            if not isinstance(cal, dict):
+                return
+            self.depth_estimator.update_vlm_calibration(
+                scale_factor=cal.get('scene_scale_factor'),
+                horizon_ratio=cal.get('horizon_ratio'),
+                track_depths=cal.get('track_depths'),
+                reasoning_note=cal.get('depth_reasoning', ''),
+                model_name=cal.get('model_name', ''),
+            )
+            self.predictor.apply_vlm_depth_verification(
+                scale_factor=cal.get('scene_scale_factor'),
+                track_depths=cal.get('track_depths'),
+                recommended_radar_range_m=cal.get('recommended_radar_range_m'),
+                depth_reasoning=cal.get('depth_reasoning', ''),
+                model_name=cal.get('model_name', ''),
+            )
+
         self.decision_forecaster = DecisionForecaster(
             backend=decision_backend,
             device=device,
             jev_key_file=jev_key_file,
+            ollama_url=ollama_url,
+            on_vlm_obstacles=self.predictor.inject_vlm_obstacles,
+            on_vlm_depth_calibration=_on_vlm_depth_cal,
+            enable_bg_depth_verifier=start_decision_worker,
         )
         if start_decision_worker:
             self.decision_forecaster.start()
@@ -122,11 +162,15 @@ class State:
                     'source': 'yolo',
                     'position_kind': 'floor_estimate' if xy else 'bearing_only'
                 })
+            # Enrich with GX10 Monocular Metric Depth when floor calibration is absent (or add depth_m)
+            depth_objects, depth_info = self.depth_estimator.estimate_objects(
+                raw_objects, width, height, frame_bgr=frame_bgr, calibration_config=config, jpeg_bytes=data
+            )
             enriched_objects, scenario = self.predictor.update(
-                raw_objects, width, height, timestamp=started, calibration_config=config
+                depth_objects, width, height, timestamp=started, calibration_config=config
             )
 
-        self.decision_forecaster.submit(scenario)
+        self.decision_forecaster.submit(scenario, jpeg_bytes=data)
         latest_dec = self.decision_forecaster.latest()
         if latest_dec is not None:
             scenario['decision'] = latest_dec
@@ -150,7 +194,13 @@ class State:
                 **result,
                 'zones_3': zones_3,
                 'objects': enriched_objects,
+                'remembered_objects': scenario.get('remembered_objects', []),
+                'occupancy_cells': scenario.get('occupancy_cells', []),
+                'free_space_contour': scenario.get('free_space_contour', []),
+                'radar_max_range_m': scenario.get('radar_max_range_m', 7.0),
+                'vlm_depth_report': scenario.get('vlm_depth_report'),
                 'scenario': scenario,
+                'depth': depth_info,
                 'predicted_zones_1s': scenario['predicted_zones_1s'],
                 'predicted_zones_2s': scenario['predicted_zones_2s'],
                 'predicted_zones_3s': scenario['predicted_zones_3s'],
@@ -171,12 +221,25 @@ class State:
             valid = bool(frame and age is not None and not self.error and not self.paused and age < self.max_age and frame.get('status','ok') == 'ok')
             status = 'paused' if self.paused else 'error' if self.error else 'waiting' if frame is None or age is None else 'live' if valid else 'stale'
             config = self.config
+            depth_active = self.depth_estimator.mode != 'off'
             objects = []
             if valid:
                 for obj in frame.get('objects', []):
-                    xy = project(obj['xyxy'], frame['width'], frame['height'], config) if config else None
-                    objects.append({**obj, 'ground_xy': xy, 'source': 'yolo',
-                                    'position_kind': 'floor_estimate' if xy else 'bearing_only'})
+                    if config:
+                        xy = project(obj['xyxy'], frame['width'], frame['height'], config)
+                        pos_kind = 'floor_estimate' if xy else 'bearing_only'
+                    elif depth_active and obj.get('depth_xy'):
+                        xy = obj.get('depth_xy')
+                        pos_kind = 'monocular_depth'
+                    else:
+                        xy = None
+                        pos_kind = 'bearing_only'
+                    objects.append({
+                        **obj,
+                        'ground_xy': xy,
+                        'source': 'yolo',
+                        'position_kind': pos_kind,
+                    })
             capture_fps = (
                 round((len(self.arrivals)-1)/(self.arrivals[-1]-self.arrivals[0]),2)
                 if valid and len(self.arrivals)>1 and self.arrivals[-1]>self.arrivals[0] else 0
@@ -188,14 +251,26 @@ class State:
             if scenario and decision:
                 scenario['decision'] = decision
             rife_info = frame.get('rife') if frame else {'rife_enabled': self.interpolator.factor > 0, 'factor': self.interpolator.factor, 'backend': self.interpolator.backend}
+            depth_info = frame.get('depth') if frame else {'enabled': depth_active, 'mode': self.depth_estimator.mode, 'backend': self.depth_estimator._active_backend, 'depth_ms': 0.0}
             zones_6 = frame['zones'] if valid else [-1]*6
             zones_3 = frame.get('zones_3', six_to_three_zones(zones_6)) if valid else [-1]*3
+            remembered_objects = scenario.get('remembered_objects', []) if scenario else []
+            occupancy_cells = scenario.get('occupancy_cells', []) if scenario else []
+            free_space_contour = scenario.get('free_space_contour', []) if scenario else []
+            radar_max_range_m = scenario.get('radar_max_range_m', 7.0) if scenario else 7.0
+            vlm_depth_report = scenario.get('vlm_depth_report') if scenario else None
+            map_mode = 'floor_estimate' if config else ('monocular_depth' if depth_active else 'bearing_only')
             return {'mode': self.mode, 'status': status, 'valid': valid,
                     'error': self.error, 'age_ms': round(age*1000) if age is not None else None,
                     'max_age_ms': round(self.max_age*1000), 'frame': frame,
                     'capture_fps': capture_fps,
                     'stream_fps': stream_fps,
                     'rife': rife_info,
+                    'depth': depth_info,
+                    'depth_mode': self.depth_estimator.mode,
+                    'memory_ttl_s': self.predictor.memory_ttl_s,
+                    'classes_spec': self.classes_spec,
+                    'model_spec': self.model_spec,
                     'scenario': scenario,
                     'decision': decision,
                     'decision_backend': self.decision_forecaster.requested_backend,
@@ -203,8 +278,14 @@ class State:
                     'predicted_zones_2s': scenario['predicted_zones_2s'] if scenario else [-1]*6,
                     'predicted_zones_3s': scenario['predicted_zones_3s'] if scenario else [-1]*6,
                     'predicted_zones_3_2s': (decision['recommended_pre_alert_zones_3'] if decision else scenario.get('predicted_zones_3_2s', [-1]*3)) if scenario else [-1]*3,
-                    'objects': objects, 'zones': zones_6, 'zones_3': zones_3,
-                    'calibration': config, 'map_mode': 'floor_estimate' if config else 'bearing_only',
+                    'objects': objects,
+                    'remembered_objects': remembered_objects,
+                    'occupancy_cells': occupancy_cells,
+                    'free_space_contour': free_space_contour,
+                    'radar_max_range_m': radar_max_range_m,
+                    'vlm_depth_report': vlm_depth_report,
+                    'zones': zones_6, 'zones_3': zones_3,
+                    'calibration': config, 'map_mode': map_mode,
                     'rotate': self.rotate}
 
     def control(self, paused):
@@ -237,10 +318,16 @@ class State:
             self.mode = mode
             self.rotate = 270 if mode == 'live' else 0
             self.generation += 1
+            self.frame = None
             self.arrivals.clear()
             self.stream_arrivals.clear()
             self.started = None
             self.error = None
+        with self.broadcaster._lock:
+            self.broadcaster._pacer_seq += 1
+            self.broadcaster._latest_jpeg = None
+            for q in self.broadcaster._subscribers:
+                q.clear()
         self.predictor.reset()
         self.interpolator.reset()
 
@@ -251,6 +338,28 @@ class State:
             self.interpolator.factor = factor
             self.interpolator.stats['factor'] = factor
         self.interpolator.reset()
+
+    def set_memory_ttl(self, memory_ttl_s):
+        if type(memory_ttl_s) not in (int, float) or not math.isfinite(memory_ttl_s) or not 0 <= float(memory_ttl_s) <= 60:
+            raise ValueError('memory_ttl_s must be a number between 0 and 60')
+        self.predictor.set_memory_ttl(float(memory_ttl_s))
+
+    def set_depth_mode(self, mode):
+        self.depth_estimator.set_mode(mode)
+
+    def set_classes(self, classes_spec):
+        resolved = resolve_classes(classes_spec)
+        if not resolved:
+            raise ValueError('At least one obstacle class is required')
+        with self.lock:
+            self.classes_spec = str(classes_spec).strip()
+
+    def set_model(self, model_spec):
+        spec = str(model_spec or '').strip()
+        if not spec:
+            raise ValueError('model must be a non-empty detector model name or auto')
+        with self.lock:
+            self.model_spec = spec
 
     def set_decision_backend(self, backend):
         self.decision_forecaster.set_backend(backend)
@@ -267,28 +376,42 @@ class State:
                 pass
 
 
-
-
 def demo_frame(index):
     im = Image.new('RGB', (640,480), '#d8e0e4'); draw = ImageDraw.Draw(im)
     draw.rectangle((0,240,640,480), fill='#b7c2c5')
     for line_x in range(-640,1280,120): draw.line((320,240,line_x,480),fill='#a0adb3',width=2)
     # Smooth sinusoidal human running pace across sensor field
-    # 60 frames per roundtrip (~2.4s at 25 fps, human running speed ~2.5 m/s)
     phase = ((index % 60) / 60.0) * 2 * math.pi
     x = int(280 + 200 * math.sin(phase))
     draw.ellipse((x+20,125,x+60,165),fill='#3f5d70')
     draw.rounded_rectangle((x,168,x+80,340),radius=15,fill='#3f5d70')
     draw.rectangle((x+5,330,x+28,410),fill='#3f5d70');draw.rectangle((x+52,330,x+75,410),fill='#3f5d70')
+
+    objects = [{'class': 'person', 'confidence': .94, 'xyxy': [x, 125, x+80, 410]}]
+    box_spans = [(x, x+80)]
+
+    # Stationary chair on left-peripheral that periodically slips out of FOV to demonstrate 12s Spatial Memory
+    if (index % 90) < 62:
+        cx1, cy1, cx2, cy2 = 52, 235, 134, 385
+        draw.rounded_rectangle((cx1, cy1, cx2, cy2), radius=8, fill='#5b4b3a')
+        objects.append({'class': 'chair', 'confidence': .89, 'xyxy': [cx1, cy1, cx2, cy2]})
+        box_spans.append((cx1, cx2))
+
+    # Stationary dining table / backpack on right side that alternates visibility
+    if 15 <= (index % 90) < 78:
+        tx1, ty1, tx2, ty2 = 490, 225, 605, 368
+        draw.rounded_rectangle((tx1, ty1, tx2, ty2), radius=6, fill='#4a5568')
+        objects.append({'class': 'dining table', 'confidence': .87, 'xyxy': [tx1, ty1, tx2, ty2]})
+        box_spans.append((tx1, tx2))
+
     draw.text((20,20),'SIMULATION / NOT A CAMERA CAPTURE',fill='#273947')
     data=io.BytesIO();im.save(data,format='JPEG')
-    objects=[{'class':'person','confidence':.94,'xyxy':[x,125,x+80,410]}]
     return data.getvalue(), {'width':640,'height':480,'objects':objects,
-                             'zones':zone_states([(x,x+80)],640,[i/6 for i in range(7)])}
+                             'zones':zone_states(box_spans,640,[i/6 for i in range(7)])}
 
 
 class SnapshotCamera:
-    """Reuse the camera HTTP connection; reconnect only when it closes or fails."""
+    """Reuse the camera HTTP connection; reconnect cleanly when closed without overwhelming ESP32 LWIP."""
     def __init__(self, url, timeout):
         self.url = urllib.parse.urlsplit(url)
         self.timeout = min(float(timeout), 2.5) if timeout > 0 else timeout
@@ -298,7 +421,7 @@ class SnapshotCamera:
     def _request_once(self):
         if self.connection.sock is not None:
             try:
-                self.connection.sock.settimeout(min(self.timeout, 1.4))
+                self.connection.sock.settimeout(min(self.timeout, 1.8))
             except OSError:
                 pass
         query = self.url.query + ('&' if self.url.query else '') + '_cb=' + str(time.time_ns())
@@ -323,7 +446,7 @@ class SnapshotCamera:
             return self._request_once()
         except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError,
                 http.client.BadStatusLine, http.client.CannotSendRequest,
-                http.client.ResponseNotReady, TimeoutError) as exc:
+                http.client.ResponseNotReady) as exc:
             self.close()
             if had_socket:
                 self.connection = self.cls(self.url.hostname, self.url.port, timeout=self.timeout)
@@ -331,6 +454,7 @@ class SnapshotCamera:
             raise
         except Exception:
             self.close()
+            self.connection = self.cls(self.url.hostname, self.url.port, timeout=self.timeout)
             raise
 
     def close(self):
@@ -475,6 +599,7 @@ def run_source(state, args, stop):
                 detect=True,
                 model=args.model,
                 device=args.device,
+                classes=getattr(args, 'classes', 'indoor_nav'),
                 max_result_age_ms=args.max_age * 1000,
                 save_disk=getattr(args, 'save_artifacts', False),
                 predict_horizon=False
@@ -496,13 +621,15 @@ def run_source(state, args, stop):
                         fetched = time.monotonic()
                         buffer.put((raw, started, fetched))
                         consecutive_errors = 0
-                        stop.wait(0.015)
+                        with state.lock:
+                            state.error = None
+                        stop.wait(0.05)
                     except Exception as exc:
                         consecutive_errors += 1
                         with state.lock:
-                            if consecutive_errors >= 4 or (state.frame is None and consecutive_errors >= 2):
+                            if consecutive_errors >= 8 or (state.frame is None and consecutive_errors >= 3):
                                 state.error = str(exc)
-                        stop.wait(0.12 if consecutive_errors < 4 else 0.30)
+                        stop.wait(0.35 if consecutive_errors < 4 else 0.60)
                 if camera:
                     camera.close()
 
@@ -544,7 +671,9 @@ def run_source(state, args, stop):
         last_gen = 0
         while not stop.is_set():
             with state.lock:
-                paused, generation, rotate, current_mode = state.paused, state.generation, state.rotate, state.mode
+                paused, generation, rotate, current_mode, classes_spec, model_spec = (
+                    state.paused, state.generation, state.rotate, state.mode, state.classes_spec, state.model_spec
+                )
             if paused:
                 buffer.clear()
                 stop.wait(0.1)
@@ -553,6 +682,16 @@ def run_source(state, args, stop):
             try:
                 frame_bgr = None
                 if current_mode == 'live' and args.camera_url:
+                    if pipeline is not None and getattr(pipeline, 'model_spec', None) != model_spec:
+                        try:
+                            pipeline.set_model(model_spec)
+                        except Exception:
+                            pass
+                    if pipeline is not None and getattr(pipeline, 'classes_spec', None) != classes_spec:
+                        try:
+                            pipeline.set_classes(classes_spec)
+                        except Exception:
+                            pass
                     item, _, gen = buffer.get(last_gen, timeout=0.1)
                     if item is None or gen == last_gen:
                         continue
@@ -691,10 +830,34 @@ def handler_for(state):
                     if type(factor) is not int or not 0 <= factor <= 8:
                         raise ValueError('factor must be an integer between 0 and 8')
                     state.set_rife(factor)
+                elif self.path=='/api/memory':
+                    ttl=payload.get('memory_ttl_s')
+                    if type(ttl) is bool or type(ttl) not in (int, float) or not 0 <= float(ttl) <= 60:
+                        raise ValueError('memory_ttl_s must be between 0 and 60')
+                    state.set_memory_ttl(float(ttl))
+                    return self.send(200,{'ok':True,'memory_ttl_s':state.predictor.memory_ttl_s})
+                elif self.path=='/api/depth':
+                    d_mode=payload.get('mode')
+                    if d_mode not in ('auto','hybrid','pinhole','neural','off'):
+                        raise ValueError('depth mode must be auto, hybrid, pinhole, neural, or off')
+                    state.set_depth_mode(d_mode)
+                    return self.send(200,{'ok':True,'depth_mode':state.depth_estimator.mode})
+                elif self.path=='/api/classes':
+                    cls_spec=payload.get('classes')
+                    if not isinstance(cls_spec, str) or not cls_spec.strip():
+                        raise ValueError('classes must be a non-empty preset or comma-separated list')
+                    state.set_classes(cls_spec)
+                    return self.send(200,{'ok':True,'classes_spec':state.classes_spec,'classes':sorted(resolve_classes(state.classes_spec))})
+                elif self.path=='/api/model':
+                    mdl_spec=payload.get('model')
+                    if not isinstance(mdl_spec, str) or not mdl_spec.strip():
+                        raise ValueError('model must be a non-empty detector model name or auto')
+                    state.set_model(mdl_spec)
+                    return self.send(200,{'ok':True,'model_spec':state.model_spec,'resolved_model':resolve_detector_model(state.model_spec)})
                 elif self.path=='/api/decision':
                     backend=payload.get('backend')
-                    if backend not in ('auto','laya','jev','kinematic'):
-                        raise ValueError('backend must be auto, laya, jev, or kinematic')
+                    if backend not in DecisionForecaster.VALID_BACKENDS:
+                        raise ValueError(f'backend must be one of {DecisionForecaster.VALID_BACKENDS}')
                     state.set_decision_backend(backend)
                 elif self.path=='/api/calibration':
                     config=None if payload.get('clear') is True else calibration(payload)
@@ -720,10 +883,15 @@ def main():
     p.add_argument('--demo', action='store_true', help='Start in simulation mode')
     p.add_argument('--mode', choices=['live', 'simulation', 'replay'], default=None, help='Initial feed mode')
     p.add_argument('--port',type=int,default=8080)
-    p.add_argument('--model',default='yolo26n.pt');p.add_argument('--device',default='0')
+    p.add_argument('--model',default='auto',help='Detector model (auto, yolov8l-worldv2.pt, yolo26x.pt, yolo26l.pt, yolov8s-worldv2.pt, yolo26n.pt)')
+    p.add_argument('--device',default='0')
+    p.add_argument('--classes',default='indoor_nav',help='Obstacle class preset (indoor_nav, full_surround, core) or comma-separated list')
+    p.add_argument('--memory-ttl',type=float,default=12.0,help='Persistent radar spatial memory retention in seconds (default: 12.0)')
+    p.add_argument('--depth-mode',choices=['auto','hybrid','pinhole','neural','off'],default='auto',help='GX10 monocular metric depth estimation mode (default: auto)')
     p.add_argument('--rotate',type=int,choices=[0,90,180,270],default=None,help='Clockwise rotation before detection (default: 270 for live, 0 for simulation/replay)')
     p.add_argument('--rife-factor',type=int,default=0,help='RIFE optical-flow intermediate frames per capture (default: 0 / Off)')
-    p.add_argument('--decision-backend',choices=['auto','laya','jev','kinematic'],default='laya',help='System-1 decision model backend (default: laya)')
+    p.add_argument('--decision-backend',choices=list(DecisionForecaster.VALID_BACKENDS),default='gemma4:26b',help='Decision model backend (default: gemma4:26b on GX10 Ollama, falls back to laya/kinematic)')
+    p.add_argument('--ollama-url',default='http://127.0.0.1:11434',help='Local GX10 Ollama server URL (default: http://127.0.0.1:11434)')
     p.add_argument('--jev-key-file',default='private/jev_api_key.txt',help='Path to private file containing TypeSafe Jev API key')
     p.add_argument('--stream',action='store_true',help='Force continuous multipart MJPEG video stream ingestion')
     p.add_argument('--save-artifacts',action='store_true',help='Save diagnostic artifacts (latest.jpg, latest.json) to disk')
@@ -748,9 +916,10 @@ def main():
     if args.rotate is None:
         args.rotate = 270 if mode == 'live' else 0
     if args.interval is None: args.interval=0.04 if args.camera_url else .5
-    if (not 1 <= args.port <= 65535 or not all(math.isfinite(v) for v in (args.interval,args.timeout,args.max_age))
-            or args.interval < 0 or args.timeout <= 0 or args.max_age <= 0 or not 0 <= args.rife_factor <= 8):
-        p.error('Invalid port, timing, or RIFE factor settings.')
+    if (not 1 <= args.port <= 65535 or not all(math.isfinite(v) for v in (args.interval,args.timeout,args.max_age,args.memory_ttl))
+            or args.interval < 0 or args.timeout <= 0 or args.max_age <= 0 or not 0 <= args.rife_factor <= 8
+            or not 0 <= args.memory_ttl <= 60):
+        p.error('Invalid port, timing, memory TTL, or RIFE factor settings.')
     if args.camera_url and urllib.parse.urlsplit(args.camera_url).scheme not in ('http','https'):
         p.error('Camera URL must use HTTP or HTTPS.')
     try:
@@ -771,6 +940,11 @@ def main():
         decision_backend=args.decision_backend,
         jev_key_file=args.jev_key_file,
         start_decision_worker=True,
+        memory_ttl_s=args.memory_ttl,
+        depth_mode=args.depth_mode,
+        classes_spec=args.classes,
+        model_spec=args.model,
+        ollama_url=args.ollama_url,
     )
     stop=threading.Event()
     server=ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(state))

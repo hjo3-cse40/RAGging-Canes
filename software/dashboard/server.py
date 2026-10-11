@@ -38,6 +38,7 @@ from software.predictor import (
     TrajectoryPredictor,
     six_to_three_zones,
 )
+from software.haptics import Controller as HapticController, Settings as HapticSettings, handler_for as haptic_handler
 from .geometry import calibration, project
 
 STATIC = Path(__file__).parent
@@ -132,7 +133,8 @@ class State:
                  jev_key_file='private/jev_api_key.txt', start_decision_worker=False,
                  memory_ttl_s=12.0, depth_mode='auto', classes_spec='indoor_nav',
                  model_spec='auto', ollama_url='http://127.0.0.1:11434',
-                 camera_resolution='320x240', camera_quality=14, stream_mode='auto'):
+                 camera_resolution='320x240', camera_quality=14, stream_mode='auto',
+                 haptic_settings=None):
         self.lock = threading.Lock()
         self.mode, self.output, self.max_age = mode, Path(output), max_age
         self.rotate = rotate
@@ -142,6 +144,8 @@ class State:
         self.paused = False
         self.config = config
         self.generation = 0
+        self.observation_sequence = 0
+        self.haptics = HapticController(haptic_settings)
         self.classes_spec = classes_spec if classes_spec else 'indoor_nav'
         self.model_spec = str(model_spec or 'auto').strip()
         _, norm_res = normalize_camera_resolution(camera_resolution)
@@ -213,6 +217,17 @@ class State:
                 depth_objects, width, height, timestamp=started, calibration_config=config
             )
 
+        with self.lock:
+            if self.paused or generation != self.generation:
+                return
+            self.observation_sequence += 1
+            scenario['haptic_observation'] = {
+                'generation': generation, 'sequence': self.observation_sequence,
+                'started': started, 'source_mode': result.get('source_mode', 'unknown'),
+                'objects': [{k: obj.get(k) for k in
+                             ('current_zone_3', 'depth_m', 'realistic', 'remembered')}
+                            for obj in enriched_objects],
+            }
         self.decision_forecaster.submit(scenario, jpeg_bytes=data)
         latest_dec = self.decision_forecaster.latest()
         if latest_dec is not None:
@@ -256,6 +271,24 @@ class State:
             for _ in frames_out:
                 self.stream_arrivals.append(now)
         self.broadcaster.broadcast_paced(frames_out, target_interval_s=avg_gap_s)
+
+    def _haptic_locked(self, decision=None):
+        decision = decision if decision is not None else self.decision_forecaster.latest()
+        frame_fresh = (self.frame is not None and self.started is not None
+                       and 0 <= time.monotonic()-self.started < self.max_age
+                       and not self.paused and not self.error
+                       and self.frame.get('status', 'ok') == 'ok')
+        backend_matches = bool(decision and decision.get('requested_backend') == self.decision_forecaster.requested_backend)
+        return self.haptics.command(decision, self.generation, enabled=frame_fresh and backend_matches)
+
+    def haptic_command(self):
+        with self.lock:
+            command = self._haptic_locked()
+            # Simulated/replayed signals remain visible as previews, never drive hardware.
+            if self.mode != 'live' or command.get('source_mode') != 'live':
+                return {**command, 'valid': False, 'status': 'preview_only',
+                        'motor_valid_3': [False]*3, 'motor_strength_3': [0]*3, 'ttl_ms': 0}
+            return command
 
     def snapshot(self):
         with self.lock:
@@ -320,6 +353,7 @@ class State:
                     'model_spec': self.model_spec,
                     'scenario': scenario,
                     'decision': decision,
+                    'haptics': {**self._haptic_locked(decision), 'preview_only': self.mode != 'live'},
                     'decision_backend': self.decision_forecaster.requested_backend,
                     'predicted_zones_1s': scenario['predicted_zones_1s'] if scenario else [-1]*6,
                     'predicted_zones_2s': scenario['predicted_zones_2s'] if scenario else [-1]*6,
@@ -1197,6 +1231,8 @@ def run_source(state, args, stop):
                     raw_to_publish, result = demo_frame(index)
                     stop.wait(0.04)
 
+                result['source_mode'] = ('live' if current_mode == 'live' and args.camera_url
+                                         else 'replay' if current_mode == 'replay' and replay else 'simulation')
                 result['frame_id'] = index + 1
                 state.publish(raw_to_publish, result, started, generation, frame_bgr=frame_bgr)
                 index += 1
@@ -1373,6 +1409,16 @@ def main():
     p.add_argument('--demo', action='store_true', help='Start in simulation mode')
     p.add_argument('--mode', choices=['live', 'simulation', 'replay'], default=None, help='Initial feed mode')
     p.add_argument('--port',type=int,default=8080)
+    p.add_argument('--command-port', type=int, default=8002, help='Dedicated v2 motor command listener')
+    p.add_argument('--command-bind', default='127.0.0.1', help='Set to GX10 LAN IP for ESP32 access')
+    p.add_argument('--command-token-file', type=Path, help='Optional bearer token shared with ESP32')
+    p.add_argument('--haptic-near', type=float, default=0.5)
+    p.add_argument('--haptic-far', type=float, default=3.0)
+    p.add_argument('--haptic-activate', type=float, default=0.65)
+    p.add_argument('--haptic-deactivate', type=float, default=0.45)
+    p.add_argument('--haptic-rise', type=float, default=0.08)
+    p.add_argument('--haptic-fall', type=float, default=0.25)
+    p.add_argument('--haptic-max-age', type=float, default=2.5)
     p.add_argument('--model',default='auto',help='Detector model (auto, yolov8l-worldv2.pt, yolo26x.pt, yolo26l.pt, yolov8s-worldv2.pt, yolo26n.pt)')
     p.add_argument('--device',default='0')
     p.add_argument('--classes',default='indoor_nav',help='Obstacle class preset (indoor_nav, full_surround, core) or comma-separated list')
@@ -1420,6 +1466,18 @@ def main():
         config=calibration(payload) if payload else None
     except (ValueError,OSError) as exc:
         p.error(str(exc))
+    try:
+        haptic_settings = HapticSettings(args.haptic_near, args.haptic_far,
+                                         args.haptic_activate, args.haptic_deactivate,
+                                         args.haptic_rise, args.haptic_fall, args.haptic_max_age)
+        if not 1 <= args.command_port <= 65535 or args.command_port == args.port:
+            raise ValueError('Command port must be valid and distinct from dashboard port')
+        command_token = args.command_token_file.read_text().strip() if args.command_token_file else None
+        if args.command_token_file and (not command_token or not command_token.isascii()
+                                       or any(c.isspace() for c in command_token)):
+            raise ValueError('Command token must be a nonempty ASCII token without whitespace')
+    except (ValueError, OSError) as exc:
+        p.error(str(exc))
     stream_mode = 'snapshot' if args.no_stream else ('mjpeg' if args.stream else args.stream_mode)
     state=State(
         mode,
@@ -1440,15 +1498,36 @@ def main():
         camera_resolution=args.camera_res,
         camera_quality=args.camera_quality,
         stream_mode=stream_mode,
+        haptic_settings=haptic_settings,
     )
-    stop=threading.Event()
-    server=ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(state))
-    worker=threading.Thread(target=run_source,args=(state,args,stop),daemon=True);worker.start()
-    print(f'YOLO dashboard: http://127.0.0.1:{args.port} ({mode})',flush=True)
-    try: server.serve_forever()
-    except KeyboardInterrupt: pass
+    stop = threading.Event()
+    server = command_server = command_thread = worker = None
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1', args.port), handler_for(state))
+        command_server = ThreadingHTTPServer((args.command_bind, args.command_port),
+                                             haptic_handler(state.haptic_command, command_token))
+        command_thread = threading.Thread(target=command_server.serve_forever, daemon=True)
+        command_thread.start()
+        print(f'Motor commands: http://{args.command_bind}:{args.command_port}/command', flush=True)
+        worker = threading.Thread(target=run_source, args=(state, args, stop), daemon=True)
+        worker.start()
+        print(f'YOLO dashboard: http://127.0.0.1:{args.port} ({mode})', flush=True)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        stop.set();state.decision_forecaster.stop();server.server_close();worker.join(timeout=1)
+        stop.set()
+        state.decision_forecaster.stop()
+        if command_thread is not None:
+            command_server.shutdown()
+            command_thread.join(timeout=1)
+        if command_server is not None:
+            command_server.server_close()
+        if server is not None:
+            server.server_close()
+        if worker is not None:
+            worker.join(timeout=1)
+
 
 
 if __name__=='__main__': main()

@@ -338,6 +338,23 @@ input[type="checkbox"] {
   color: var(--cyan);
 }
 
+.stage-tag.right-tag {
+  left: auto;
+  right: 12px;
+  color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.25);
+}
+
+.stage-tag.right-tag.warn {
+  color: var(--amber);
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.stage-tag.right-tag.danger {
+  color: var(--red);
+  border-color: rgba(239, 68, 68, 0.55);
+}
+
 .camera-footer {
   padding: 12px 20px;
   display: flex;
@@ -384,6 +401,13 @@ input[type="checkbox"] {
   color: #ffffff;
   box-shadow: 0 0 15px rgba(0, 245, 212, 0.3);
   transform: translateY(-2px);
+}
+
+.zone.predicted {
+  border-style: dashed;
+  border-color: var(--amber);
+  color: var(--amber);
+  background: rgba(245, 158, 11, 0.08);
 }
 
 .zone.unknown {
@@ -434,6 +458,11 @@ input[type="checkbox"] {
 .dot.amber {
   background: var(--amber);
   box-shadow: 0 0 8px var(--amber);
+}
+
+.dot.forecast-dot {
+  border: 1.5px dashed #38bdf8;
+  background: rgba(56, 189, 248, 0.25);
 }
 
 .dot.outline {

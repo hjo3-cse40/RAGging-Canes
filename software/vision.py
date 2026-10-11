@@ -58,12 +58,21 @@ def parse_boundaries(value):
 class Pipeline:
     def __init__(self, output, detect=False, model="yolo26n.pt", device="0",
                  classes="person,chair", confidence=0.35, boundaries=None,
-                 max_result_age_ms=1000, rotate=0, save_disk=True):
+                 max_result_age_ms=1000, rotate=0, save_disk=True,
+                 predict_horizon=True):
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.boundaries = boundaries or [i / 6 for i in range(7)]
         self.rotate = rotate
         self.save_disk = save_disk
+        self.predict_horizon = predict_horizon
+        self.predictor = None
+        if predict_horizon:
+            try:
+                from software.predictor import TrajectoryPredictor
+            except ImportError:
+                from predictor import TrajectoryPredictor
+            self.predictor = TrajectoryPredictor(boundaries=self.boundaries)
         self.lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.latest = None
@@ -140,6 +149,12 @@ class Pipeline:
                     x = int(edge * width)
                     draw.line((x, 0, x, height), fill="yellow", width=2)
         inferred = time.monotonic()
+        source_started = observation_started if observation_started is not None else started
+        scenario = None
+        if self.predictor is not None and (self.model is not None or objects):
+            objects, scenario = self.predictor.update(
+                objects, width, height, timestamp=source_started
+            )
         response = {
             "frame_id": frame_id,
             "status": "ok" if self.model is not None else "received_only",
@@ -151,6 +166,11 @@ class Pipeline:
             "inference_ms": round((inferred - decoded) * 1000, 2),
             "sector_basis": "configured_pixel_boundaries",
         }
+        if scenario is not None:
+            response["scenario"] = scenario
+            response["predicted_zones_1s"] = scenario["predicted_zones_1s"]
+            response["predicted_zones_2s"] = scenario["predicted_zones_2s"]
+            response["predicted_zones_3s"] = scenario["predicted_zones_3s"]
         if self.save_disk:
             # Atomic replacement prevents viewers reading a partially written image.
             temp = self.output / "latest.tmp"

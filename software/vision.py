@@ -58,10 +58,12 @@ def parse_boundaries(value):
 class Pipeline:
     def __init__(self, output, detect=False, model="yolo26n.pt", device="0",
                  classes="person,chair", confidence=0.35, boundaries=None,
-                 max_result_age_ms=1000):
+                 max_result_age_ms=1000, rotate=0, save_disk=True):
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.boundaries = boundaries or [i / 6 for i in range(7)]
+        self.rotate = rotate
+        self.save_disk = save_disk
         self.lock = threading.Lock()
         self.state_lock = threading.Lock()
         self.latest = None
@@ -99,9 +101,22 @@ class Pipeline:
             result["zones"] = [-1] * 6
         return result
 
-    def process(self, data, frame_id, observation_started=None):
+    def process(self, data, frame_id, observation_started=None, image_input=None):
         started = time.monotonic()
-        image = decode_jpeg(data)
+        if image_input is not None:
+            image = image_input
+            if hasattr(image, "shape"):  # NumPy ndarray
+                width, height = image.shape[1], image.shape[0]
+            else:
+                width, height = image.width, image.height
+        else:
+            image = decode_jpeg(data)
+            if self.rotate:
+                image = image.rotate(-self.rotate, expand=True)
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=95)
+                data = output.getvalue()
+            width, height = image.width, image.height
         decoded = time.monotonic()
         objects, boxes = [], []
         annotated = None
@@ -117,36 +132,38 @@ class Pipeline:
                                 "confidence": round(float(box.conf.item()), 4),
                                 "xyxy": xyxy})
                 boxes.append((xyxy[0], xyxy[2]))
-            # plot() returns a BGR array; convert to RGB for Pillow.
-            annotated = Image.fromarray(result.plot()[:, :, ::-1])
-            draw = ImageDraw.Draw(annotated)
-            for edge in self.boundaries[1:-1]:
-                x = int(edge * image.width)
-                draw.line((x, 0, x, image.height), fill="yellow", width=2)
+            if self.save_disk:
+                # plot() returns a BGR array; convert to RGB for Pillow.
+                annotated = Image.fromarray(result.plot()[:, :, ::-1])
+                draw = ImageDraw.Draw(annotated)
+                for edge in self.boundaries[1:-1]:
+                    x = int(edge * width)
+                    draw.line((x, 0, x, height), fill="yellow", width=2)
         inferred = time.monotonic()
         response = {
             "frame_id": frame_id,
             "status": "ok" if self.model is not None else "received_only",
-            "zones": zone_states(boxes, image.width, self.boundaries)
+            "zones": zone_states(boxes, width, self.boundaries)
                      if self.model is not None else [-1] * 6,
             "objects": objects, "bytes": len(data),
-            "width": image.width, "height": image.height,
+            "width": width, "height": height,
             "decode_ms": round((decoded - started) * 1000, 2),
             "inference_ms": round((inferred - decoded) * 1000, 2),
             "sector_basis": "configured_pixel_boundaries",
         }
-        # Atomic replacement prevents viewers reading a partially written image.
-        temp = self.output / "latest.tmp"
-        temp.write_bytes(data)
-        temp.replace(self.output / "latest.jpg")
-        if annotated is not None:
-            annotated.save(self.output / "annotated.tmp", format="JPEG")
-            (self.output / "annotated.tmp").replace(self.output / "latest.annotated.jpg")
+        if self.save_disk:
+            # Atomic replacement prevents viewers reading a partially written image.
+            temp = self.output / "latest.tmp"
+            temp.write_bytes(data)
+            temp.replace(self.output / "latest.jpg")
+            if annotated is not None:
+                annotated.save(self.output / "annotated.tmp", format="JPEG")
+                (self.output / "annotated.tmp").replace(self.output / "latest.annotated.jpg")
+            (self.output / "latest.json").write_text(json.dumps(response, indent=2))
         response["processing_ms"] = round((time.monotonic() - started) * 1000, 2)
         source_started = observation_started if observation_started is not None else started
         response["observation_to_result_ms"] = round(
             (time.monotonic() - source_started) * 1000, 2)
-        (self.output / "latest.json").write_text(json.dumps(response, indent=2))
         with self.state_lock:
             self.latest_started = source_started
             self.command_sequence += 1
@@ -260,6 +277,8 @@ def main():
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--max-result-age-ms", type=int, default=1000)
     parser.add_argument("--timeout", type=float, default=3.0, help="Snapshot fetch timeout in seconds")
+    parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=270,
+                        help="Clockwise rotation before detection (default: 270 for 90° CW mount / 90° CCW correction)")
     parser.add_argument("--frames", type=int, default=0, help="Stop pull mode after N attempts; 0 runs until stopped")
     parser.add_argument("--token-file", help="Bearer token file; required for a LAN listener")
     parser.add_argument("--idle-without-client", action="store_true",
@@ -285,7 +304,7 @@ def main():
         parser.error("A LAN listener requires --token-file; use loopback for SSH testing")
     pipeline = Pipeline(args.output, args.detect, args.model, args.device,
                         args.classes, args.confidence, args.boundaries,
-                        args.max_result_age_ms)
+                        args.max_result_age_ms, rotate=args.rotate)
     if args.mode == "image":
         print(json.dumps(pipeline.process(Path(args.path).read_bytes(), "offline-1"), indent=2))
     elif args.mode == "serve":

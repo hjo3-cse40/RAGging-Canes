@@ -149,3 +149,40 @@ Tests cover HTTP receipt and saved image retrieval, corrupted-JPEG rejection, co
 Before increasing capture rate, measure median and p95 fresh-frame fetch, inference, and scene-change-to-vibration latency. Test moving person/chair objects in all six sectors, centered objects, edges, low light, camera turns, disconnection, and reconnect. Compare Nemotron and YOLO on the same cap images. Only retain the 500 ms scene-change target if the integrated measurements support it.
 
 The existing Nemotron deployment at `/home/asus/projects/RAGging-Canes` uses port 8000 and five zones. It has not been replaced. The YOLO deployment uses `/home/asus/RAGging-Canes` and port 8001. See [six-zone client](../firmware/README.md) for the prepared receive-only adapter; physical motor integration remains unverified.
+
+## Capture samples and check repeatability
+
+The deployed Nemotron service already requests temperature `0` and `think: false`.
+A low temperature does not establish repeatability; test identical bytes separately
+from changing camera frames. The evaluator aligns both models to six person/chair
+zones and repeats each saved JPEG with Nemotron temperatures `0` and `0.1`, seed
+`42`, and thinking disabled. YOLO uses its existing confidence threshold of `0.35`.
+
+```bash
+.venv/bin/python -m software.evaluate_camera \
+  --camera-url http://ESP32_IP/capture --frames 24 --repeats 3 \
+  --model /absolute/path/yolo26n.pt --output artifacts/evaluation-new
+```
+
+Use a **new** output directory. Pause competing capture/inference loops with an
+external restoration trap (see `INTEGRATION_REVIEW.md`). Captures finish before
+inference begins. The tool saves JPEGs, hashes, capture failures, paired outputs,
+first-pass YOLO annotations, and repeatability/timing summaries. Alternate backend
+order and revisit each image in later rounds; each request starts a fresh chat.
+
+To replay saved samples, replace `--camera-url ... --frames 24` with
+`--images /absolute/path/frame-001.jpg /absolute/path/frame-002.jpg`.
+`--temperatures 0 0.1`, `--seed 42`, and `--repeats 3` can be changed explicitly.
+`summary.json` counts exact **zone-array** stability among repeated images with
+no failed inference calls. This is not bounding-box bitwise identity or accuracy.
+The per-backend p95 is an empirical nearest-rank value on this small sample.
+Model timings include request/processing overhead and exclude camera capture,
+sampling wait, motors, and the other backend. Saved-image replay can benefit from
+caching; first requests may incur setup costs. Capture socket timeouts are
+inactivity timeouts; use an external total-run timeout for bounded experiments.
+An error produces a nonzero exit status while preserving completed results.
+
+Rotate sideways camera images into the wearer-aligned orientation **before**
+defining left-to-right strips. Comparing arrays from different orientations is
+not a valid directional accuracy comparison. Keep original captures as evidence.
+See `CAMERA_EVALUATION.md` for measured results and the bird's-eye mapping proposal.

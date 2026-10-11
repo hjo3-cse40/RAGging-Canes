@@ -1040,6 +1040,7 @@ def run_source(state, args, stop):
             def producer_loop():
                 nonlocal camera, applied_cfg_seq
                 consecutive_errors = 0
+                sensor_configured = (getattr(camera, 'transport', '') != 'http_keepalive')
                 while not stop.is_set():
                     with state.lock:
                         paused, current_mode = state.paused, state.mode
@@ -1053,6 +1054,7 @@ def run_source(state, args, stop):
                         continue
                     if cfg_seq != applied_cfg_seq:
                         applied_cfg_seq = cfg_seq
+                        sensor_configured = False
                         try:
                             if camera:
                                 camera.close()
@@ -1064,12 +1066,30 @@ def run_source(state, args, stop):
                                 quality=target_qual,
                                 configure_sensor=True,
                             )
+                            sensor_configured = True
                             with state.lock:
                                 state.camera_transport = getattr(camera, 'transport', 'mjpeg_stream')
                         except Exception:
                             pass
                     started = time.monotonic()
                     try:
+                        if not sensor_configured:
+                            # ESP32 may have powered on after server start; configure 320x240 & try stream
+                            try:
+                                new_cam = create_camera(
+                                    args.camera_url,
+                                    args.timeout,
+                                    is_stream=target_stream_mode,
+                                    resolution=target_res,
+                                    quality=target_qual,
+                                    configure_sensor=True,
+                                )
+                                if camera:
+                                    camera.close()
+                                camera = new_cam
+                                sensor_configured = True
+                            except Exception:
+                                pass
                         read_fn = getattr(camera, 'read_latest', camera.read)
                         raw = read_fn()
                         fetched = time.monotonic()
@@ -1082,6 +1102,8 @@ def run_source(state, args, stop):
                             stop.wait(0.015)
                     except Exception as exc:
                         consecutive_errors += 1
+                        if consecutive_errors >= 2:
+                            sensor_configured = False
                         with state.lock:
                             if consecutive_errors >= 8 or (state.frame is None and consecutive_errors >= 3):
                                 state.error = str(exc)

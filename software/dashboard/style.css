@@ -249,7 +249,8 @@ h2 {
 .panel-controls {
   display: flex;
   align-items: center;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .control-label {
@@ -410,6 +411,13 @@ input[type="checkbox"] {
   background: rgba(245, 158, 11, 0.08);
 }
 
+.zone.memory {
+  border-style: dotted;
+  border-color: #a855f7;
+  color: #c084fc;
+  background: rgba(168, 85, 247, 0.08);
+}
+
 .zone.unknown {
   border-style: dashed;
   color: #64748b;
@@ -517,12 +525,13 @@ input[type="checkbox"] {
 
 .legend {
   display: flex;
-  gap: 24px;
+  flex-wrap: wrap;
+  gap: 18px;
   justify-content: center;
   color: #94a3b8;
   font-size: 12px;
   font-weight: 500;
-  margin: 10px 0;
+  margin: 10px 16px;
 }
 
 .dot {
@@ -541,6 +550,23 @@ input[type="checkbox"] {
 .dot.amber {
   background: var(--amber);
   box-shadow: 0 0 8px var(--amber);
+}
+
+.dot.memory-dot {
+  border: 1.5px dashed #a855f7;
+  background: rgba(168, 85, 247, 0.35);
+  box-shadow: 0 0 6px rgba(168, 85, 247, 0.5);
+}
+
+.dot.voxel-dot {
+  border-radius: 2px;
+  border: 1px solid #38bdf8;
+  background: rgba(56, 189, 248, 0.3);
+}
+
+.dot.freespace-dot {
+  border: 1.5px solid rgba(16, 185, 129, 0.8);
+  background: rgba(16, 185, 129, 0.2);
 }
 
 .dot.forecast-dot {

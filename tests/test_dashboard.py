@@ -240,5 +240,66 @@ class DashboardTests(unittest.TestCase):
                 server.server_close()
                 thread.join()
 
+    def test_gx10_memory_depth_and_classes_endpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = State('live', directory, memory_ttl_s=12.0, depth_mode='pinhole')
+            state.publish(
+                b'jpeg',
+                {
+                    'frame_id': 1,
+                    'width': 640,
+                    'height': 480,
+                    'zones': [0, 0, 1, 1, 0, 0],
+                    'objects': [{'class': 'person', 'confidence': 0.92, 'xyxy': [280, 120, 360, 410]}],
+                },
+                time.monotonic(),
+                0,
+            )
+            snap = state.snapshot()
+            # Without 4-point manual calibration, monocular depth auto-populates ground_xy!
+            self.assertEqual(snap['map_mode'], 'monocular_depth')
+            self.assertIsNotNone(snap['objects'][0]['ground_xy'])
+            self.assertEqual(snap['objects'][0]['position_kind'], 'monocular_depth')
+
+            server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(state))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f'http://127.0.0.1:{server.server_port}'
+            try:
+                def post(path, body):
+                    req = urllib.request.Request(
+                        base + path,
+                        json.dumps(body).encode(),
+                        {'Content-Type': 'application/json', 'Connection': 'close'},
+                    )
+                    with urllib.request.urlopen(req) as resp:
+                        return json.loads(resp.read())
+
+                res_mem = post('/api/memory', {'memory_ttl_s': 20.0})
+                self.assertEqual(res_mem['memory_ttl_s'], 20.0)
+                self.assertEqual(state.predictor.memory_ttl_s, 20.0)
+
+                res_depth = post('/api/depth', {'mode': 'off'})
+                self.assertEqual(res_depth['depth_mode'], 'off')
+                self.assertEqual(state.snapshot()['map_mode'], 'bearing_only')
+
+                res_cls = post('/api/classes', {'classes': 'indoor_nav'})
+                self.assertGreaterEqual(len(res_cls['classes']), 16)
+
+                res_mdl = post('/api/model', {'model': 'yolov8l-worldv2.pt'})
+                self.assertEqual(res_mdl['model_spec'], 'yolov8l-worldv2.pt')
+                self.assertEqual(state.model_spec, 'yolov8l-worldv2.pt')
+
+                res_dec = post('/api/decision', {'backend': 'gemma4:26b'})
+                self.assertTrue(res_dec['ok'])
+                self.assertEqual(state.decision_forecaster.requested_backend, 'gemma4:26b')
+            finally:
+                state.decision_forecaster.stop()
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
 
 if __name__=='__main__':unittest.main()
+
+

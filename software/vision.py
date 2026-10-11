@@ -47,6 +47,66 @@ def zone_states(boxes, width, boundaries):
     return zones
 
 
+OBSTACLE_CLASS_PRESETS = {
+    "core": "person,chair",
+    "indoor_nav": (
+        "person,chair,couch,dining table,bench,potted plant,bed,refrigerator,"
+        "tv,laptop,backpack,handbag,suitcase,bicycle,dog,cat"
+    ),
+    "full_surround": (
+        "person,chair,couch,dining table,bench,potted plant,bed,refrigerator,"
+        "tv,laptop,backpack,handbag,suitcase,bicycle,dog,cat,door,stairs,trash can,table,desk,curb"
+    ),
+}
+DEFAULT_OBSTACLE_CLASSES = OBSTACLE_CLASS_PRESETS["indoor_nav"]
+
+
+GX10_DETECTOR_MODELS = (
+    "yolov8l-worldv2.pt",
+    "yolo26x.pt",
+    "yolo26l.pt",
+    "yolov8s-worldv2.pt",
+    "yolo26m.pt",
+    "yolo26s.pt",
+    "yolo26n.pt",
+)
+
+
+def resolve_detector_model(model_spec="auto"):
+    """Resolve the best available local YOLO detector weight for the 128 GB RAM GX10 or local checkout."""
+    spec = str(model_spec or "yolo26n.pt").strip()
+    search_roots = [
+        Path.cwd(),
+        Path(__file__).resolve().parent.parent,
+        Path("/home/asus/RAGging-Canes"),
+    ]
+    if spec.lower() == "auto":
+        for cand_name in GX10_DETECTOR_MODELS:
+            for root in search_roots:
+                cand_path = root / cand_name
+                if cand_path.is_file():
+                    return str(cand_path)
+        return "yolo26n.pt"
+    p = Path(spec)
+    if p.is_file():
+        return str(p)
+    for root in search_roots:
+        cand_path = root / p.name
+        if cand_path.is_file():
+            return str(cand_path)
+    return spec
+
+
+def resolve_classes(classes_spec):
+    """Expand a preset name ('core', 'indoor_nav', 'full_surround') or comma-separated class list."""
+    if not classes_spec:
+        return set()
+    spec = str(classes_spec).strip()
+    if spec in OBSTACLE_CLASS_PRESETS:
+        spec = OBSTACLE_CLASS_PRESETS[spec]
+    return {x.strip() for x in spec.split(",") if x.strip()}
+
+
 def parse_boundaries(value):
     edges = [float(x) for x in value.split(",")]
     if (len(edges) != 7 or edges[0] != 0 or edges[-1] != 1
@@ -81,21 +141,62 @@ class Pipeline:
         self.command_sequence = 0
         self.last_command_poll = None
         self.max_result_age_ms = max_result_age_ms
+        self.model_spec = str(model or "yolo26n.pt").strip()
+        resolved_model = resolve_detector_model(model)
+        self.model_name = str(resolved_model)
         self.model = None
         self.device = device
         self.confidence = confidence
-        self.class_names = {x.strip() for x in classes.split(",") if x.strip()}
+        self.classes_spec = classes
+        self.class_names = resolve_classes(classes)
         if not self.class_names:
             raise ValueError("At least one target class is required")
         if detect:
             from ultralytics import YOLO
-            self.model = YOLO(model)
-            known = set(self.model.names.values())
-            if not self.class_names <= known:
-                raise ValueError(f"Unsupported classes: {self.class_names - known}")
+            self.model = YOLO(resolved_model)
+            self._configure_model_classes(self.class_names, strict=(classes not in OBSTACLE_CLASS_PRESETS))
             # Warm up and fail immediately if the selected GPU/runtime cannot run.
             self.model.predict(Image.new("RGB", (640, 480)), device=device,
                                imgsz=640, verbose=False)
+
+    def _configure_model_classes(self, requested_classes, strict=True):
+        if self.model is None:
+            self.class_names = set(requested_classes)
+            return
+        # Support YOLO-World open-vocabulary class registration on GX10
+        if hasattr(self.model, "set_classes") and "world" in self.model_name.lower():
+            try:
+                self.model.set_classes(sorted(requested_classes))
+            except Exception:
+                pass
+        known = set(self.model.names.values())
+        if strict and not (requested_classes <= known):
+            raise ValueError(f"Unsupported classes: {requested_classes - known}")
+        supported = requested_classes & known
+        if not supported:
+            raise ValueError(f"Unsupported classes: {requested_classes - known}")
+        self.class_names = supported
+
+    def set_classes(self, classes_spec):
+        new_classes = resolve_classes(classes_spec)
+        if not new_classes:
+            raise ValueError("At least one target class is required")
+        with self.state_lock:
+            self.classes_spec = classes_spec
+            self._configure_model_classes(new_classes, strict=(classes_spec not in OBSTACLE_CLASS_PRESETS))
+
+    def set_model(self, model_spec):
+        spec = str(model_spec or "yolo26n.pt").strip()
+        resolved_model = resolve_detector_model(spec)
+        from ultralytics import YOLO
+        new_model = YOLO(resolved_model)
+        with self.lock, self.state_lock:
+            self.model_spec = spec
+            self.model_name = str(resolved_model)
+            self.model = new_model
+            req_classes = resolve_classes(self.classes_spec)
+            self._configure_model_classes(req_classes, strict=(self.classes_spec not in OBSTACLE_CLASS_PRESETS))
+            self.model.predict(Image.new("RGB", (640, 480)), device=self.device, imgsz=640, verbose=False)
 
     def current_result(self):
         with self.state_lock:

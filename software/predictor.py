@@ -400,11 +400,386 @@ class RIFEInterpolator:
         }
 
 
-class TrajectoryPredictor:
-    """Kalman / Kinematic 3-Second Object Trajectory Predictor & Physical Realism Filter.
+# Physical class priors for Monocular Depth Estimation, Stationary Realism Filtering, and Spatial Memory
+CLASS_METADATA = {
+    "person": {"height_m": 1.70, "width_m": 0.52, "dynamic": True, "category": "pedestrian"},
+    "bicycle": {"height_m": 1.05, "width_m": 0.65, "dynamic": True, "category": "vehicle"},
+    "car": {"height_m": 1.50, "width_m": 1.80, "dynamic": True, "category": "vehicle"},
+    "motorcycle": {"height_m": 1.15, "width_m": 0.75, "dynamic": True, "category": "vehicle"},
+    "dog": {"height_m": 0.50, "width_m": 0.45, "dynamic": True, "category": "pet"},
+    "cat": {"height_m": 0.30, "width_m": 0.35, "dynamic": True, "category": "pet"},
+    "chair": {"height_m": 0.85, "width_m": 0.55, "dynamic": False, "category": "furniture"},
+    "couch": {"height_m": 0.85, "width_m": 1.85, "dynamic": False, "category": "furniture"},
+    "bench": {"height_m": 0.80, "width_m": 1.40, "dynamic": False, "category": "furniture"},
+    "dining table": {"height_m": 0.76, "width_m": 1.25, "dynamic": False, "category": "furniture"},
+    "table": {"height_m": 0.76, "width_m": 1.20, "dynamic": False, "category": "furniture"},
+    "desk": {"height_m": 0.75, "width_m": 1.20, "dynamic": False, "category": "furniture"},
+    "bed": {"height_m": 0.65, "width_m": 1.50, "dynamic": False, "category": "furniture"},
+    "potted plant": {"height_m": 0.75, "width_m": 0.45, "dynamic": False, "category": "obstacle"},
+    "refrigerator": {"height_m": 1.75, "width_m": 0.80, "dynamic": False, "category": "structure"},
+    "door": {"height_m": 2.00, "width_m": 0.90, "dynamic": False, "category": "structure"},
+    "stairs": {"height_m": 0.95, "width_m": 1.20, "dynamic": False, "category": "elevation"},
+    "curb": {"height_m": 0.20, "width_m": 1.20, "dynamic": False, "category": "elevation"},
+    "trash can": {"height_m": 0.75, "width_m": 0.45, "dynamic": False, "category": "obstacle"},
+    "backpack": {"height_m": 0.48, "width_m": 0.36, "dynamic": False, "category": "trip_hazard"},
+    "handbag": {"height_m": 0.38, "width_m": 0.34, "dynamic": False, "category": "trip_hazard"},
+    "suitcase": {"height_m": 0.62, "width_m": 0.42, "dynamic": False, "category": "trip_hazard"},
+    "tv": {"height_m": 0.55, "width_m": 0.95, "dynamic": False, "category": "electronics"},
+    "laptop": {"height_m": 0.28, "width_m": 0.36, "dynamic": False, "category": "electronics"},
+}
 
-    Tracks detected objects (`person`, `chair`, etc.), evaluates whether their motion is
-    physically realistic vs. sensor noise / head-turn ego-motion, and projects 0.5s–3.0s
+
+def get_class_metadata(cls_name):
+    key = str(cls_name or "person").strip().lower()
+    return CLASS_METADATA.get(key, {"height_m": 0.90, "width_m": 0.55, "dynamic": False, "category": "obstacle"})
+
+
+class MonocularDepthEstimator:
+    """GX10 Local Monocular Metric Depth Estimator (Neural Depth-Anything-V2 + Pinhole/Horizon Geometry).
+
+    Converts 2D camera detections into metric (X, Y) floor coordinates in meters on the top-down radar
+    even when manual 4-point floor calibration is not present or when an object's feet are cropped.
+
+    Modes:
+    - `auto` / `hybrid`: Uses local HuggingFace `depth-anything/Depth-Anything-V2-Small-hf` on GX10 GPU/MPS
+      if cached/available in background, fused with pinhole class-height & floor-horizon geometry.
+    - `pinhole`: Ultra-fast (<0.2 ms) geometric + physical class-height + horizon-perspective metric depth.
+    - `neural`: Prioritizes dense neural depth map from `Depth-Anything-V2` on GPU/MPS.
+    - `off`: Disabled (relies strictly on manual 4-point homography calibration).
+    """
+
+    DEFAULT_HF_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+    CAMERA_HFOV_DEG = 62.0
+    CAMERA_HEIGHT_M = 1.62  # Typical cap-mounted camera height on standing wearer
+
+    def __init__(self, mode="auto", device="auto", model_id=None):
+        self.mode = mode if mode in ("auto", "hybrid", "pinhole", "neural", "off") else "auto"
+        self.device = RIFEInterpolator._resolve_device(device)
+        self.model_id = model_id or self.DEFAULT_HF_MODEL
+        self._lock = threading.Lock()
+        self._pipe = None
+        self._pipe_failed = False
+        self._latest_depth_map = None
+        self._last_depth_ms = 0.0
+        self._active_backend = "pinhole_metric_hybrid" if self.mode != "off" else "off"
+        # Asynchronous GX10 VLM Depth Reasoner calibration state
+        self._vlm_scale_factor = 1.0
+        self._vlm_horizon_ratio = None
+        self._vlm_track_depths = {}  # track_id -> {"depth_m": float, "x_m": float, "ts": float}
+        self._vlm_spatial_note = None
+        self._vlm_model_name = None
+        self._vlm_last_ts = 0.0
+
+    def set_mode(self, mode):
+        if mode not in ("auto", "hybrid", "pinhole", "neural", "off"):
+            raise ValueError("Depth mode must be auto, hybrid, pinhole, neural, or off")
+        with self._lock:
+            self.mode = mode
+            self._active_backend = "off" if mode == "off" else (
+                "depth_anything_v2" if (self._pipe is not None and mode in ("auto", "hybrid", "neural"))
+                else "pinhole_metric_hybrid"
+            )
+
+    _SHARED_PIPES = {}
+    _SHARED_PIPE_LOCK = threading.Lock()
+
+    def update_vlm_calibration(self, scale_factor=None, horizon_ratio=None, track_depths=None,
+                               reasoning_note=None, model_name="gemma4:26b"):
+        """Apply asynchronous depth & perspective calibration reasoned by the GX10 local VLM."""
+        now = time.monotonic()
+        with self._lock:
+            if scale_factor is not None:
+                try:
+                    sf = max(0.40, min(1.75, float(scale_factor)))
+                    self._vlm_scale_factor = round(0.45 * self._vlm_scale_factor + 0.55 * sf, 3)
+                except (TypeError, ValueError):
+                    pass
+            if horizon_ratio is not None:
+                try:
+                    hr = max(0.04, min(0.55, float(horizon_ratio)))
+                    self._vlm_horizon_ratio = round(
+                        hr if self._vlm_horizon_ratio is None else (0.45 * self._vlm_horizon_ratio + 0.55 * hr),
+                        3,
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(track_depths, list):
+                for item in track_depths:
+                    if not isinstance(item, dict):
+                        continue
+                    tid = item.get("track_id")
+                    v_depth = item.get("verified_depth_m", item.get("depth_m"))
+                    if tid is not None and v_depth is not None:
+                        try:
+                            entry = {"depth_m": max(0.4, min(15.0, float(v_depth))), "ts": now}
+                            if item.get("verified_x_m") is not None:
+                                entry["x_m"] = max(-5.5, min(5.5, float(item["verified_x_m"])))
+                            self._vlm_track_depths[int(tid)] = entry
+                        except (TypeError, ValueError):
+                            pass
+            # Prune stale per-track VLM overrides older than 8s
+            self._vlm_track_depths = {
+                k: v for k, v in self._vlm_track_depths.items() if (now - v.get("ts", 0.0)) <= 8.0
+            }
+            if reasoning_note:
+                self._vlm_spatial_note = str(reasoning_note).strip()
+            self._vlm_model_name = model_name
+            self._vlm_last_ts = now
+
+    def _ensure_neural_pipe(self):
+        if self._pipe is not None:
+            return self._pipe
+        if self._pipe_failed or self.mode in ("pinhole", "off"):
+            return None
+        # In 'auto' mode, only run heavy dense transformer depth on GPU (CUDA/MPS) so CPU stays <1ms
+        if self.mode == "auto" and self.device == "cpu":
+            return None
+        cache_key = (self.model_id, self.device)
+        with self._SHARED_PIPE_LOCK:
+            if cache_key in self._SHARED_PIPES:
+                self._pipe = self._SHARED_PIPES[cache_key]
+                self._active_backend = "depth_anything_v2"
+                return self._pipe
+        try:
+            os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+            from transformers import pipeline as hf_pipeline
+            dev_arg = 0 if self.device.startswith("cuda") else ("mps" if self.device == "mps" else -1)
+            # Load from local cache first so we never stall offline test runners
+            try:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                self._pipe = hf_pipeline(
+                    task="depth-estimation",
+                    model=self.model_id,
+                    device=dev_arg,
+                )
+            except Exception:
+                if self.mode == "neural":
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+                    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                    self._pipe = hf_pipeline(
+                        task="depth-estimation",
+                        model=self.model_id,
+                        device=dev_arg,
+                    )
+                else:
+                    self._pipe_failed = True
+                    return None
+            with self._SHARED_PIPE_LOCK:
+                self._SHARED_PIPES[cache_key] = self._pipe
+            self._active_backend = "depth_anything_v2"
+            return self._pipe
+        except Exception:
+            self._pipe_failed = True
+            return None
+
+    def _compute_neural_depth_map(self, frame_bgr=None, jpeg_bytes=None):
+        valid_jpeg = isinstance(jpeg_bytes, (bytes, bytearray)) and len(jpeg_bytes) > 64 and jpeg_bytes[:2] == b"\xff\xd8"
+        if (frame_bgr is None and not valid_jpeg) or self.mode in ("pinhole", "off"):
+            return None
+        now = time.monotonic()
+        with self._lock:
+            last_ts = getattr(self, "_latest_depth_ts", 0.0)
+            if self._latest_depth_map is not None and (now - last_ts) < 0.12:
+                return self._latest_depth_map
+        pipe = self._ensure_neural_pipe()
+        if pipe is None or np is None:
+            return None
+        t0 = time.perf_counter()
+        try:
+            if frame_bgr is not None:
+                rgb = frame_bgr[:, :, ::-1] if frame_bgr.ndim == 3 else frame_bgr
+                pil_im = Image.fromarray(rgb)
+            else:
+                pil_im = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+            if pil_im.width > 384:
+                pil_im = pil_im.resize((384, 288), Image.Resampling.BILINEAR)
+            out = pipe(pil_im)
+            depth_tensor = out.get("predicted_depth")
+            if depth_tensor is not None:
+                d_arr = depth_tensor.detach().cpu().numpy() if hasattr(depth_tensor, "detach") else np.asarray(depth_tensor)
+                if d_arr.ndim == 3:
+                    d_arr = d_arr[0]
+                d_min, d_max = float(np.percentile(d_arr, 2)), float(np.percentile(d_arr, 98))
+                if d_max > d_min + 1e-5:
+                    norm_inv = np.clip((d_arr - d_min) / (d_max - d_min), 0.02, 1.0)
+                    with self._lock:
+                        self._latest_depth_map = norm_inv
+                        self._latest_depth_ts = time.monotonic()
+                        self._last_depth_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                        self._active_backend = "depth_anything_v2"
+                    return norm_inv
+        except Exception:
+            pass
+        return None
+
+    def estimate_object(self, obj, width, height, inv_depth_map=None, scene_horizon_ratio=0.30, scene_scale=1.0):
+        """Estimate metric distance `depth_m` and `[x_m, y_m]` ground coordinates for one detection."""
+        width = max(1, float(width or 640))
+        height = max(1, float(height or 480))
+        xyxy = obj.get("xyxy", [0, 0, 10, 10])
+        x1, y1, x2, y2 = [float(v) for v in xyxy]
+        bw = max(6.0, x2 - x1)
+        bh = max(8.0, y2 - y1)
+        cx = 0.5 * (x1 + x2)
+
+        meta = get_class_metadata(obj.get("class", "person"))
+        real_h = meta["height_m"]
+        real_w = meta["width_m"]
+
+        # 1. Pinhole focal length from horizontal FOV
+        hfov_rad = math.radians(self.CAMERA_HFOV_DEG)
+        fx = (0.5 * width) / math.tan(0.5 * hfov_rad)
+        fy = fx
+
+        # 2. Angular size depth estimate (compensating for bottom/top cropping and elevated cameras)
+        bottom_cropped = y2 >= (height - 6.0)
+        top_cropped = y1 <= 6.0
+        # Soft-compress extreme far-field box-height blowup when viewing from an elevated/angled camera
+        raw_z_height = (fy * real_h) / max(12.0, bh)
+        if raw_z_height > 4.2:
+            z_height = 4.2 + math.pow(raw_z_height - 4.2, 0.72)
+        else:
+            z_height = raw_z_height
+        z_width = (fx * real_w) / max(10.0, bw)
+
+        if bottom_cropped or top_cropped:
+            z_pinhole = 0.45 * z_height + 0.55 * z_width
+        else:
+            z_pinhole = 0.72 * z_height + 0.28 * z_width
+
+        # 3. Ground-contact vertical horizon perspective (higher y2 = lower in image = closer to camera)
+        horizon_y = scene_horizon_ratio * height
+        if not bottom_cropped and y2 > horizon_y + 8.0:
+            norm_depression = max(0.06, min(1.0, (y2 - horizon_y) / max(1.0, (height - horizon_y))))
+            # Maps norm_depression=1.0 (bottom edge) -> ~1.15m, norm_depression=0.50 -> ~2.4m, norm_depression=0.25 -> ~5.0m
+            z_floor = 1.15 / math.pow(norm_depression, 1.05)
+            # Weight ground-contact perspective more strongly when objects are smaller / elevated camera view
+            floor_weight = 0.64 if (bh / height) < 0.30 else 0.42
+            z_geom = (1.0 - floor_weight) * z_pinhole + floor_weight * z_floor
+        else:
+            z_geom = z_pinhole
+
+        # 4. Fuse with dense neural inverse depth map from GX10 Depth-Anything-V2
+        z_final = z_geom
+        source = "pinhole_metric_hybrid"
+        if inv_depth_map is not None and np is not None:
+            dh, dw = inv_depth_map.shape[:2]
+            # Sample lower-center patch (torso to feet) for accurate ground-contact depth
+            ix1 = int(max(0, min(dw - 1, (x1 + 0.22 * bw) * dw / width)))
+            ix2 = int(max(ix1 + 1, min(dw, (x2 - 0.22 * bw) * dw / width)))
+            iy1 = int(max(0, min(dh - 1, (y1 + 0.35 * bh) * dh / height)))
+            iy2 = int(max(iy1 + 1, min(dh, (y2 - 0.08 * bh) * dh / height)))
+            patch = inv_depth_map[iy1:iy2, ix1:ix2]
+            if patch.size > 0:
+                rel_closeness = float(np.median(patch))  # 1.0 = very close (~0.8m), 0.10 = far (~7m)
+                z_neural = 0.85 / max(0.11, math.pow(rel_closeness, 0.82))
+                neural_w = 0.62 if self.mode == "neural" else 0.52
+                z_final = neural_w * z_neural + (1.0 - neural_w) * z_geom
+                source = "depth_anything_v2"
+
+        # 5. Apply GX10 Local VLM Depth Reasoner scale calibration & per-track verification
+        z_final = z_final * scene_scale
+        tid = obj.get("track_id")
+        with self._lock:
+            vlm_override = self._vlm_track_depths.get(int(tid)) if tid is not None else None
+            vlm_model = self._vlm_model_name
+        if vlm_override is not None:
+            # Smoothly blend 65% VLM-verified depth with 35% live frame depth so motion stays responsive
+            z_final = 0.65 * vlm_override["depth_m"] + 0.35 * z_final
+            source = f"vlm_verified:{vlm_model or 'gx10'}"
+
+        # Allow physical range up to 14.0m (radar auto-scales its rings to fit all targets inside the dome)
+        y_m = max(0.35, min(14.0, z_final))
+        # Lateral X (meters right of camera centerline)
+        u_offset = (cx / width) - 0.5
+        angle_x = u_offset * hfov_rad
+        x_m = y_m * math.tan(angle_x)
+        if vlm_override is not None and "x_m" in vlm_override:
+            x_m = 0.6 * vlm_override["x_m"] + 0.4 * x_m
+        x_m = max(-6.0, min(6.0, x_m))
+        depth_m = round(math.hypot(x_m, y_m), 2)
+        return {
+            "depth_m": depth_m,
+            "depth_xy": [round(x_m, 3), round(y_m, 3)],
+            "depth_source": source,
+            "category": meta["category"],
+            "dynamic_class": meta["dynamic"],
+        }
+
+    def estimate_objects(self, objects, width, height, frame_bgr=None, calibration_config=None, jpeg_bytes=None):
+        """Enrich objects with monocular depth (`depth_m`, `depth_xy`) and auto-fill `ground_xy` when uncalibrated."""
+        if self.mode == "off":
+            return [dict(o) for o in (objects or [])], {"enabled": False, "backend": "off", "depth_ms": 0.0}
+
+        t0 = time.perf_counter()
+        inv_map = self._compute_neural_depth_map(frame_bgr=frame_bgr, jpeg_bytes=jpeg_bytes)
+        width_f = max(1.0, float(width or 640))
+        height_f = max(1.0, float(height or 480))
+
+        # Scene-adaptive horizon & scale: if objects are small or high up in the frame (e.g. elevated/outdoor camera),
+        # automatically raise the horizon and normalize scale so targets spread naturally across 2.5m..7.0m
+        objs_list = list(objects or [])
+        with self._lock:
+            vlm_scale = self._vlm_scale_factor
+            vlm_horizon = self._vlm_horizon_ratio
+            vlm_note = self._vlm_spatial_note
+            vlm_model = self._vlm_model_name
+
+        scene_horizon = vlm_horizon if vlm_horizon is not None else 0.30
+        auto_scale = vlm_scale
+        if objs_list and vlm_horizon is None:
+            min_y1_ratio = min(float(o.get("xyxy", [0, 0, 10, 10])[1]) / height_f for o in objs_list)
+            med_bh_ratio = sorted(
+                (float(o.get("xyxy", [0, 0, 10, 10])[3]) - float(o.get("xyxy", [0, 0, 10, 10])[1])) / height_f
+                for o in objs_list
+            )[len(objs_list) // 2]
+            if min_y1_ratio < 0.35 or med_bh_ratio < 0.26:
+                # Elevated or wide-field camera view: horizon is near the top of the frame
+                scene_horizon = max(0.06, min(0.24, min_y1_ratio * 0.55))
+                if vlm_scale == 1.0 and med_bh_ratio < 0.25:
+                    # Adapt scale for elevated/wide perspective so mid-ground targets map to 3.5m..6.2m
+                    auto_scale = max(0.58, min(0.92, med_bh_ratio / 0.28))
+
+        enriched = []
+        for obj in objs_list:
+            item = dict(obj)
+            est = self.estimate_object(
+                item, width_f, height_f,
+                inv_depth_map=inv_map,
+                scene_horizon_ratio=scene_horizon,
+                scene_scale=auto_scale,
+            )
+            item["depth_m"] = est["depth_m"]
+            item["depth_xy"] = est["depth_xy"]
+            item["depth_source"] = est["depth_source"]
+            item["category"] = est["category"]
+            if item.get("ground_xy") is None and calibration_config is None:
+                item["ground_xy"] = est["depth_xy"]
+                item["position_kind"] = "monocular_depth"
+            elif item.get("ground_xy") is not None and item.get("depth_m") is not None:
+                item["depth_m"] = round(math.hypot(item["ground_xy"][0], item["ground_xy"][1]), 2)
+            enriched.append(item)
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return enriched, {
+            "enabled": True,
+            "mode": self.mode,
+            "backend": self._active_backend,
+            "depth_ms": elapsed_ms,
+            "vlm_scale_factor": round(auto_scale, 3),
+            "scene_horizon_ratio": round(scene_horizon, 3),
+            "vlm_model": vlm_model,
+            "vlm_note": vlm_note,
+        }
+
+
+class TrajectoryPredictor:
+    """Kalman / Kinematic 3-Second Object Trajectory Predictor, Realism Filter & Persistent Spatial Memory.
+
+    Tracks detected objects (`person`, `chair`, `dining table`, `backpack`, `door`, etc.), evaluates
+    whether their motion is physically realistic vs. sensor noise / head-turn ego-motion, maintains a
+    multi-second ego-centric Spatial Memory Map across occlusions and head turns, and projects 0.5s–3.0s
     future bounding boxes, ground-plane paths, Time-To-Collision (TTC), and 6-zone states.
     """
 
@@ -412,24 +787,42 @@ class TrajectoryPredictor:
     MAX_METRIC_SPEED_MPS = 4.5        # Maximum physically realistic indoor human speed (m/s)
     MAX_NORM_SPEED_PER_S = 1.45       # Maximum normalized screen widths/s before flagging teleport/head-whip
     MAX_SCALE_JUMP_PER_S = 2.5        # Maximum relative bounding-box height change rate
+    CAMERA_HFOV_RAD = math.radians(62.0)
 
-    def __init__(self, boundaries=None, max_track_idle_s=1.5, alpha_pos=0.65, alpha_vel=0.45):
+    def __init__(self, boundaries=None, max_track_idle_s=1.5, memory_ttl_s=12.0,
+                 alpha_pos=0.65, alpha_vel=0.45):
         self.boundaries = boundaries or [i / 6 for i in range(7)]
         self.max_track_idle_s = float(max_track_idle_s)
+        self.memory_ttl_s = max(0.0, float(memory_ttl_s))
         self.alpha_pos = float(alpha_pos)
         self.alpha_vel = float(alpha_vel)
         self._lock = threading.Lock()
         self._tracks = {}
+        self._occupancy_grid = {}
         self._next_id = 1
         self._last_ts = None
         self._keyframes = deque(maxlen=45)
+        self._vlm_recommended_range_m = None
+        self._vlm_depth_report = None
+
+    def set_memory_ttl(self, memory_ttl_s):
+        val = float(memory_ttl_s)
+        if not math.isfinite(val) or not (0.0 <= val <= 60.0):
+            raise ValueError("memory_ttl_s must be between 0 and 60 seconds")
+        with self._lock:
+            self.memory_ttl_s = val
+            if val <= 0.0:
+                self._occupancy_grid.clear()
 
     def reset(self):
         with self._lock:
             self._tracks.clear()
+            self._occupancy_grid.clear()
             self._next_id = 1
             self._last_ts = None
             self._keyframes.clear()
+            self._vlm_recommended_range_m = None
+            self._vlm_depth_report = None
 
     @staticmethod
     def _iou(box_a, box_b):
@@ -464,6 +857,319 @@ class TrajectoryPredictor:
         y2 = max(y1 + 4.0, min(float(height), cy + 0.5 * h))
         return [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)]
 
+    @staticmethod
+    def _rotate_ground_xy(ground_xy, delta_yaw_rad):
+        """Rotate ego-centric ground coordinates (x_m, y_m) around wearer origin (0, 0) on head turn."""
+        if not ground_xy or abs(delta_yaw_rad) < 1e-4:
+            return ground_xy
+        gx, gy = float(ground_xy[0]), float(ground_xy[1])
+        cos_a = math.cos(delta_yaw_rad)
+        sin_a = math.sin(delta_yaw_rad)
+        rx = gx * cos_a - gy * sin_a
+        ry = gx * sin_a + gy * cos_a
+        rx = max(-6.5, min(6.5, rx))
+        ry = max(0.15, min(14.5, ry))
+        return [round(rx, 3), round(ry, 3)]
+
+    @staticmethod
+    def _quantize_voxel(gx, gy):
+        """Tesla-style dynamic voxel resolution: 0.35m fine near-field (<2.5m), 0.50m coarse far-field."""
+        dist = math.hypot(gx, gy)
+        res = 0.35 if dist < 2.5 else 0.50
+        return (round(round(gx / res) * res, 2), round(round(gy / res) * res, 2), res)
+
+    def _update_occupancy_cell(self, trk, now, width):
+        """Tesla Vector-Space Log-Odds Voxel + Waymo 2D Occupancy Flow Field update."""
+        if self.memory_ttl_s <= 0.0:
+            return
+        gxy = trk.get("ground_xy")
+        if gxy:
+            gx, gy = float(gxy[0]), float(gxy[1])
+        else:
+            u = (trk["cx"] / max(1.0, float(width))) - 0.5
+            ang = u * self.CAMERA_HFOV_RAD
+            dist = float(trk.get("depth_m") or 2.8)
+            gx = dist * math.sin(ang)
+            gy = dist * math.cos(ang)
+        qx, qy, res = self._quantize_voxel(gx, gy)
+        cell_key = (qx, qy)
+        existing = self._occupancy_grid.get(cell_key)
+        meta = get_class_metadata(trk["class"])
+        prev_log_odds = existing["log_odds"] if existing else 0.0
+        # Bayesian log-odds increment on observation
+        new_log_odds = min(4.2, prev_log_odds + (1.35 if trk["confidence"] >= 0.6 else 0.85))
+        occ_prob = round(1.0 / (1.0 + math.exp(-new_log_odds)), 3)
+
+        # Waymo Occupancy Flow vector (m/s in BEV ground space)
+        f_vx = float(trk.get("gvx", 0.0))
+        f_vy = float(trk.get("gvy", 0.0))
+        if not gxy:
+            # Approximate metric flow from pixel velocity
+            f_vx = round((trk.get("vx", 0.0) / max(1.0, float(width))) * 2.5, 2)
+            f_vy = round(-(trk.get("vy", 0.0) / 480.0) * 2.0, 2)
+        if existing:
+            f_vx = round(0.5 * existing.get("flow_vx", 0.0) + 0.5 * f_vx, 2)
+            f_vy = round(0.5 * existing.get("flow_vy", 0.0) + 0.5 * f_vy, 2)
+
+        self._occupancy_grid[cell_key] = {
+            "x": qx,
+            "y": qy,
+            "x_m": qx,
+            "y_m": qy,
+            "res_m": res,
+            "class": trk["class"],
+            "category": meta["category"],
+            "dynamic": meta["dynamic"],
+            "hits": (existing["hits"] + 1) if existing else 1,
+            "log_odds": round(new_log_odds, 3),
+            "occ_prob": occ_prob,
+            "flow_vx": round(f_vx, 2),
+            "flow_vy": round(f_vy, 2),
+            "confidence": round(max(trk["confidence"], existing["confidence"] if existing else 0.0), 3),
+            "last_seen": now,
+            "in_shadow": False,
+            "source": trk.get("depth_verified_by") or "yolo",
+        }
+
+    def apply_vlm_depth_verification(self, track_depths=None, recommended_radar_range_m=None,
+                                     scene_scale_factor=None, scale_factor=None, horizon_ratio=None,
+                                     reasoning_note=None, depth_reasoning=None, model_name="gemma4:26b"):
+        """Update active/remembered tracks and the BEV occupancy grid with GX10 VLM depth verification."""
+        eff_scale = scene_scale_factor if scene_scale_factor is not None else scale_factor
+        eff_reason = reasoning_note if reasoning_note is not None else depth_reasoning
+        with self._lock:
+            now = self._last_ts if self._last_ts is not None else time.monotonic()
+            if recommended_radar_range_m is not None:
+                try:
+                    rr = max(5.0, min(15.0, float(recommended_radar_range_m)))
+                    self._vlm_recommended_range_m = round(
+                        rr if self._vlm_recommended_range_m is None else (0.4 * self._vlm_recommended_range_m + 0.6 * rr),
+                        2,
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+            corrected_count = 0
+            if isinstance(track_depths, list):
+                for item in track_depths:
+                    if not isinstance(item, dict):
+                        continue
+                    tid = item.get("track_id")
+                    v_depth = item.get("verified_depth_m", item.get("depth_m"))
+                    if tid is None or v_depth is None:
+                        continue
+                    try:
+                        tid_int = int(tid)
+                        dist_m = max(0.4, min(14.0, float(v_depth)))
+                    except (TypeError, ValueError):
+                        continue
+                    trk = self._tracks.get(tid_int)
+                    if trk is None:
+                        continue
+                    old_gxy = trk.get("ground_xy")
+                    if item.get("verified_x_m") is not None:
+                        try:
+                            gx = max(-5.5, min(5.5, float(item["verified_x_m"])))
+                        except (TypeError, ValueError):
+                            gx = float(old_gxy[0]) if old_gxy else 0.0
+                    elif old_gxy:
+                        old_dist = max(0.25, math.hypot(old_gxy[0], old_gxy[1]))
+                        gx = float(old_gxy[0]) * (dist_m / old_dist)
+                    else:
+                        u = (trk["cx"] / 640.0) - 0.5
+                        gx = dist_m * math.sin(u * self.CAMERA_HFOV_RAD)
+                    gy = max(0.35, math.sqrt(max(0.15, dist_m * dist_m - gx * gx)))
+                    # Blend VLM-verified position into track & BEV voxel grid
+                    if old_gxy:
+                        gx = 0.65 * gx + 0.35 * float(old_gxy[0])
+                        gy = 0.65 * gy + 0.35 * float(old_gxy[1])
+                    trk["ground_xy"] = [round(gx, 3), round(gy, 3)]
+                    trk["depth_m"] = round(math.hypot(gx, gy), 2)
+                    trk["depth_verified_by"] = model_name
+                    self._update_occupancy_cell(trk, now, 640)
+                    corrected_count += 1
+
+            self._vlm_depth_report = {
+                "active": True,
+                "model": model_name,
+                "model_name": model_name,
+                "scale_factor": eff_scale if eff_scale is not None else 1.0,
+                "scene_scale_factor": eff_scale if eff_scale is not None else 1.0,
+                "horizon_ratio": horizon_ratio,
+                "recommended_radar_range_m": self._vlm_recommended_range_m,
+                "corrected_tracks": corrected_count,
+                "reasoning": str(eff_reason or "").strip(),
+                "updated_at": time.monotonic(),
+            }
+
+    def inject_vlm_obstacles(self, vlm_obstacles, now=None):
+        """Inject open-world obstacles discovered by GX10 Ollama VLM (gemma4:26b / qwen3.6:35b / nemotron3:33b)
+        directly into the persistent BEV occupancy grid."""
+        if not vlm_obstacles or self.memory_ttl_s <= 0.0:
+            return
+        with self._lock:
+            ts = float(now) if now is not None else (self._last_ts if self._last_ts is not None else time.monotonic())
+            zone_x_map = {"LEFT": -1.1, "CENTER": 0.0, "RIGHT": 1.1}
+            for item in vlm_obstacles[:6]:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or item.get("label") or item.get("class") or "obstacle").strip().lower()[:24]
+                zone = str(item.get("zone") or "CENTER").strip().upper()
+                try:
+                    dist_m = max(0.5, min(12.0, float(item.get("distance_m", 2.2))))
+                except (TypeError, ValueError):
+                    dist_m = 2.2
+                base_x = zone_x_map.get(zone, 0.0) * max(0.6, min(2.4, dist_m * 0.35))
+                gy = max(0.35, math.sqrt(max(0.15, dist_m * dist_m - base_x * base_x)))
+                qx, qy, res = self._quantize_voxel(base_x, gy)
+                meta = get_class_metadata(name)
+                cell_key = (qx, qy)
+                existing = self._occupancy_grid.get(cell_key)
+                lo = min(3.8, (existing["log_odds"] if existing else 0.0) + 1.15)
+                occ_p = round(1.0 / (1.0 + math.exp(-lo)), 3)
+                self._occupancy_grid[cell_key] = {
+                    "x": qx,
+                    "y": qy,
+                    "x_m": qx,
+                    "y_m": qy,
+                    "res_m": res,
+                    "class": name,
+                    "category": meta["category"],
+                    "dynamic": meta["dynamic"],
+                    "hits": (existing["hits"] + 1) if existing else 1,
+                    "log_odds": round(lo, 3),
+                    "occ_prob": occ_p,
+                    "flow_vx": existing.get("flow_vx", 0.0) if existing else 0.0,
+                    "flow_vy": existing.get("flow_vy", 0.0) if existing else 0.0,
+                    "confidence": 0.85,
+                    "last_seen": ts,
+                    "in_shadow": True,
+                    "source": "gx10_vlm",
+                }
+
+    def _step_bev_occupancy_and_raycast(self, enriched_objects, width, now, dt_global, delta_yaw_rad):
+        """Waymo Raycast Free-Space Clearing + Occlusion Shadowing + Tesla Drivable/Walkable Corridor."""
+        max_range_m = 6.5
+        num_rays = 31
+        min_ang = -math.radians(75.0)
+        max_ang = math.radians(75.0)
+        half_fov = 0.5 * self.CAMERA_HFOV_RAD
+
+        # 1. Ego-motion rotation & flow advection on existing BEV voxels
+        occ_ttl = max(15.0, self.memory_ttl_s * 1.25) if self.memory_ttl_s > 0 else 0.0
+        updated_grid = {}
+        for _, cell in list(self._occupancy_grid.items()):
+            age = now - cell["last_seen"]
+            if age > occ_ttl or self.memory_ttl_s <= 0:
+                continue
+            cx_m, cy_m = cell["x"], cell["y"]
+            if abs(delta_yaw_rad) > 1e-3:
+                cx_m, cy_m = self._rotate_ground_xy([cx_m, cy_m], delta_yaw_rad)
+            # Advect dynamic flow cells slightly when recently unseen
+            if cell.get("dynamic") and 0.05 < age <= 1.8:
+                damp = math.exp(-age * 1.2)
+                cx_m += cell.get("flow_vx", 0.0) * dt_global * damp
+                cy_m = max(0.2, cy_m + cell.get("flow_vy", 0.0) * dt_global * damp)
+            qx, qy, res = self._quantize_voxel(cx_m, cy_m)
+            # Mild temporal log-odds decay
+            decayed_lo = cell["log_odds"] - (0.08 * dt_global if not cell.get("dynamic") else 0.22 * dt_global)
+            if decayed_lo > -0.4:
+                occ_p = round(1.0 / (1.0 + math.exp(-decayed_lo)), 3)
+                updated_grid[(qx, qy)] = {
+                    **cell,
+                    "x": qx,
+                    "y": qy,
+                    "x_m": qx,
+                    "y_m": qy,
+                    "res_m": res,
+                    "log_odds": round(decayed_lo, 3),
+                    "occ_prob": occ_p,
+                }
+        self._occupancy_grid = updated_grid
+
+        # 2. Compute live obstacle polar intervals (angle_rad, dist_m) for raycasting
+        live_Polar = []
+        for obj in enriched_objects:
+            if not obj.get("realistic", True):
+                continue
+            gxy = obj.get("ground_xy")
+            if gxy:
+                ox, oy = float(gxy[0]), float(gxy[1])
+                ang = math.atan2(ox, max(0.15, oy))
+                dist = math.hypot(ox, oy)
+                half_w_ang = math.atan2(0.5 * get_class_metadata(obj["class"])["width_m"], max(0.3, dist))
+            else:
+                x1, _, x2, _ = obj.get("xyxy", [0, 0, 10, 10])
+                u_mid = ((x1 + x2) * 0.5 / max(1.0, float(width))) - 0.5
+                ang = u_mid * self.CAMERA_HFOV_RAD
+                dist = float(obj.get("depth_m") or 2.8)
+                half_w_ang = max(0.05, ((x2 - x1) / max(1.0, float(width))) * self.CAMERA_HFOV_RAD * 0.5)
+            live_Polar.append((ang - half_w_ang, ang + half_w_ang, dist))
+
+        # 3. Waymo Raycasting: clear cells in front of first hit inside camera FOV; mark cells behind hit as shadow
+        for key, cell in list(self._occupancy_grid.items()):
+            age = now - cell["last_seen"]
+            if age < 0.05:
+                cell["in_shadow"] = False
+                continue
+            cell_ang = math.atan2(cell["x"], max(0.15, cell["y"]))
+            cell_dist = math.hypot(cell["x"], cell["y"])
+            if abs(cell_ang) <= half_fov:
+                # Inside active camera frustum: check if occluded by a closer live detection
+                blocking_dist = None
+                for a_min, a_max, d_hit in live_Polar:
+                    if (a_min - 0.06) <= cell_ang <= (a_max + 0.06):
+                        if blocking_dist is None or d_hit < blocking_dist:
+                            blocking_dist = d_hit
+                if blocking_dist is not None and cell_dist > blocking_dist + 0.25:
+                    # Cell is in occlusion shadow behind a foreground object -> preserve in memory!
+                    cell["in_shadow"] = True
+                elif blocking_dist is None or cell_dist < blocking_dist - 0.40:
+                    # Direct unobstructed line-of-sight sees free space where this old cell was
+                    cell["in_shadow"] = False
+                    # Dynamic objects clear quickly when line-of-sight is empty; static furniture clears gradually
+                    clear_step = 0.95 if cell.get("dynamic") else 0.28
+                    cell["log_odds"] = round(cell["log_odds"] - clear_step, 3)
+                    cell["occ_prob"] = round(1.0 / (1.0 + math.exp(-cell["log_odds"])), 3)
+                    if cell["log_odds"] < -0.2:
+                        del self._occupancy_grid[key]
+            else:
+                # Outside current camera frustum (peripheral memory after head turn)
+                cell["in_shadow"] = True
+
+        # 4. Build Tesla-style Walkable Free-Space Contour across [-75°, +75°]
+        contour = []
+        for i in range(num_rays):
+            ray_ang = min_ang + (max_ang - min_ang) * (i / float(max(1, num_rays - 1)))
+            in_fov = abs(ray_ang) <= half_fov
+            ray_range = max_range_m
+            ray_state = "clear" if in_fov else "unobserved"
+
+            for a_min, a_max, d_hit in live_Polar:
+                if (a_min - 0.04) <= ray_ang <= (a_max + 0.04) and d_hit < ray_range:
+                    ray_range = max(0.35, d_hit)
+                    ray_state = "obstacle"
+
+            for cell in self._occupancy_grid.values():
+                c_ang = math.atan2(cell["x"], max(0.15, cell["y"]))
+                c_dist = math.hypot(cell["x"], cell["y"])
+                c_half_w = math.atan2(0.5 * cell.get("res_m", 0.4), max(0.3, c_dist))
+                if (c_ang - c_half_w - 0.03) <= ray_ang <= (c_ang + c_half_w + 0.03) and c_dist < ray_range:
+                    ray_range = max(0.35, c_dist)
+                    if ray_state != "obstacle":
+                        ray_state = "memory"
+
+            rx = round(ray_range * math.sin(ray_ang), 3)
+            ry = round(ray_range * math.cos(ray_ang), 3)
+            contour.append({
+                "angle_deg": round(math.degrees(ray_ang), 1),
+                "range_m": round(ray_range, 2),
+                "x": rx,
+                "y": ry,
+                "state": ray_state,
+            })
+        return contour
+
     def update(self, objects, width, height, timestamp=None, calibration_config=None):
         """Update tracks with current frame detections and return enriched objects + 3s scenario forecast."""
         t0 = time.perf_counter()
@@ -484,10 +1190,14 @@ class TrajectoryPredictor:
                 ground_xy = obj.get("ground_xy")
                 if ground_xy is None and calibration_config:
                     ground_xy = project(xyxy, width, height, calibration_config)
+                cls_name = obj.get("class", "person")
+                meta = get_class_metadata(cls_name)
                 candidates.append({
                     "orig_idx": idx,
                     "obj": dict(obj),
-                    "class": obj.get("class", "person"),
+                    "class": cls_name,
+                    "category": obj.get("category") or meta["category"],
+                    "dynamic": meta["dynamic"],
                     "confidence": float(obj.get("confidence", 0.5)),
                     "xyxy": [float(v) for v in xyxy],
                     "cx": cx,
@@ -495,9 +1205,10 @@ class TrajectoryPredictor:
                     "w": bw,
                     "h": bh,
                     "ground_xy": ground_xy,
+                    "depth_m": obj.get("depth_m"),
                 })
 
-            # 2. Associate candidates with active tracks (IoU + normalized center distance)
+            # 2. Associate candidates with active or remembered tracks (IoU + normalized center/ground distance)
             matched_tracks = set()
             matched_cands = {}
             pairs = []
@@ -506,13 +1217,21 @@ class TrajectoryPredictor:
                     if trk["class"] != cand["class"]:
                         continue
                     dt = max(0.015, min(2.0, now - trk["last_seen"]))
-                    pred_cx = trk["cx"] + trk["vx"] * dt
-                    pred_cy = trk["cy"] + trk["vy"] * dt
+                    pred_cx = trk["cx"] + trk["vx"] * min(dt, 1.5)
+                    pred_cy = trk["cy"] + trk["vy"] * min(dt, 1.5)
                     pred_box = self._state_to_box(pred_cx, pred_cy, trk["w"], trk["h"], width, height)
                     iou = self._iou(cand["xyxy"], pred_box)
                     norm_dist = math.hypot((cand["cx"] - pred_cx) / width, (cand["cy"] - pred_cy) / height)
-                    if iou > 0.05 or norm_dist < 0.38:
-                        score = iou * 2.0 - norm_dist
+                    ground_bonus = 0.0
+                    if cand["ground_xy"] and trk.get("ground_xy"):
+                        g_dist = math.hypot(
+                            cand["ground_xy"][0] - trk["ground_xy"][0],
+                            cand["ground_xy"][1] - trk["ground_xy"][1],
+                        )
+                        if g_dist < 1.1:
+                            ground_bonus = 0.25 * (1.1 - g_dist)
+                    if iou > 0.05 or norm_dist < 0.42 or ground_bonus > 0.05:
+                        score = iou * 2.0 - norm_dist + ground_bonus
                         pairs.append((score, c_idx, t_id))
 
             pairs.sort(key=lambda item: item[0], reverse=True)
@@ -538,6 +1257,14 @@ class TrajectoryPredictor:
                 if len(signs) == len(raw_shifts_vx) and abs(sum(signs)) == len(signs):
                     ego_vx = sum(raw_shifts_vx) / len(raw_shifts_vx)
                     ego_motion_detected = True
+            elif len(raw_shifts_vx) == 1:
+                # Single stationary furniture/structure shifting rapidly also indicates camera pan
+                only_c_idx = next(iter(matched_cands.keys()))
+                if not candidates[only_c_idx]["dynamic"] and abs(raw_shifts_vx[0]) / width > 0.35:
+                    ego_vx = raw_shifts_vx[0] * 0.7
+
+            # Angular head-turn yaw delta (radians)
+            delta_yaw_rad = -(ego_vx * dt_global / float(width)) * self.CAMERA_HFOV_RAD
 
             # 4. Update matched tracks & create new tracks
             cand_to_track = {}
@@ -568,26 +1295,27 @@ class TrajectoryPredictor:
                         velocity_plausible = velocity_plausible and (metric_speed <= self.MAX_METRIC_SPEED_MPS)
                     scale_coherent = scale_rate <= self.MAX_SCALE_JUMP_PER_S
 
-                    # Stationary class prior: chairs shouldn't walk across the room on their own
-                    if cand["class"] == "chair" and not ego_motion_detected:
+                    # Stationary class prior: furniture/structures shouldn't walk across the room on their own
+                    if not cand["dynamic"] and not ego_motion_detected:
                         if (metric_speed is not None and metric_speed > 1.2) or norm_speed > 0.65:
                             velocity_plausible = False
 
                     if velocity_plausible and scale_coherent:
-                        trk["vx"] = (1.0 - self.alpha_vel) * trk["vx"] + self.alpha_vel * inst_vx
-                        trk["vy"] = (1.0 - self.alpha_vel) * trk["vy"] + self.alpha_vel * inst_vy
-                        trk["vw"] = (1.0 - self.alpha_vel) * trk["vw"] + self.alpha_vel * inst_vw
-                        trk["vh"] = (1.0 - self.alpha_vel) * trk["vh"] + self.alpha_vel * inst_vh
+                        vel_gain = self.alpha_vel if cand["dynamic"] else (self.alpha_vel * 0.35)
+                        trk["vx"] = (1.0 - vel_gain) * trk["vx"] + vel_gain * inst_vx
+                        trk["vy"] = (1.0 - vel_gain) * trk["vy"] + vel_gain * inst_vy
+                        trk["vw"] = (1.0 - vel_gain) * trk["vw"] + vel_gain * inst_vw
+                        trk["vh"] = (1.0 - vel_gain) * trk["vh"] + vel_gain * inst_vh
                         trk["cx"] = (1.0 - self.alpha_pos) * (trk["cx"] + trk["vx"] * dt) + self.alpha_pos * cand["cx"]
                         trk["cy"] = (1.0 - self.alpha_pos) * (trk["cy"] + trk["vy"] * dt) + self.alpha_pos * cand["cy"]
                         trk["w"] = (1.0 - self.alpha_pos) * trk["w"] + self.alpha_pos * cand["w"]
                         trk["h"] = (1.0 - self.alpha_pos) * trk["h"] + self.alpha_pos * cand["h"]
                         if cand["ground_xy"]:
                             if trk.get("ground_xy"):
-                                trk["gvx"] = (1.0 - self.alpha_vel) * trk.get("gvx", 0.0) + self.alpha_vel * inst_gvx
-                                trk["gvy"] = (1.0 - self.alpha_vel) * trk.get("gvy", 0.0) + self.alpha_vel * inst_gvy
+                                trk["gvx"] = (1.0 - vel_gain) * trk.get("gvx", 0.0) + vel_gain * inst_gvx
+                                trk["gvy"] = (1.0 - vel_gain) * trk.get("gvy", 0.0) + vel_gain * inst_gvy
                             trk["ground_xy"] = cand["ground_xy"]
-                        if dt > 0.65 and cand["confidence"] < 0.55:
+                        if dt > 0.65 and cand["confidence"] < 0.55 and trk["hits"] < 2:
                             trk["hits"] = 1
                             trk["realistic"] = False
                             trk["realism_reason"] = "sparse_low_confidence_flicker"
@@ -614,11 +1342,17 @@ class TrajectoryPredictor:
                         )
 
                     trk["confidence"] = cand["confidence"]
+                    trk["depth_m"] = cand["depth_m"] or trk.get("depth_m")
+                    trk["category"] = cand["category"]
+                    trk["dynamic"] = cand["dynamic"]
                     trk["last_seen"] = now
                     trk["norm_speed"] = round(math.hypot(trk["vx"] / width, trk["vy"] / height), 3)
                     trk["metric_speed_mps"] = round(
                         math.hypot(trk.get("gvx", 0.0), trk.get("gvy", 0.0)), 2
                     ) if trk.get("ground_xy") else None
+                    if trk["realistic"] and (trk["hits"] >= 2 or trk["confidence"] >= 0.55):
+                        trk["confirmed_ever"] = True
+                        self._update_occupancy_cell(trk, now, width)
                     cand_to_track[c_idx] = trk
                 else:
                     t_id = self._next_id
@@ -627,6 +1361,8 @@ class TrajectoryPredictor:
                     trk = {
                         "track_id": t_id,
                         "class": cand["class"],
+                        "category": cand["category"],
+                        "dynamic": cand["dynamic"],
                         "confidence": cand["confidence"],
                         "cx": cand["cx"],
                         "cy": cand["cy"],
@@ -637,6 +1373,7 @@ class TrajectoryPredictor:
                         "vw": 0.0,
                         "vh": 0.0,
                         "ground_xy": cand["ground_xy"],
+                        "depth_m": cand["depth_m"],
                         "gvx": 0.0,
                         "gvy": 0.0,
                         "hits": 1,
@@ -644,19 +1381,28 @@ class TrajectoryPredictor:
                         "created_at": now,
                         "last_seen": now,
                         "realistic": confirmed_immediately,
+                        "confirmed_ever": confirmed_immediately,
                         "realism_reason": "initial_observation" if confirmed_immediately else "transient_unconfirmed",
                         "norm_speed": 0.0,
                         "metric_speed_mps": 0.0 if cand["ground_xy"] else None,
                     }
+                    if confirmed_immediately:
+                        self._update_occupancy_cell(trk, now, width)
                     self._tracks[t_id] = trk
                     cand_to_track[c_idx] = trk
 
-            # Prune expired tracks
-            expired = [tid for tid, t in self._tracks.items() if now - t["last_seen"] > self.max_track_idle_s]
+            # Prune expired tracks: confirmed tracks persist up to `memory_ttl_s`; unconfirmed blips expire at `max_track_idle_s`
+            effective_mem_ttl = max(self.max_track_idle_s, self.memory_ttl_s)
+            expired = []
+            for tid, t in self._tracks.items():
+                idle_s = now - t["last_seen"]
+                ttl_limit = effective_mem_ttl if (t.get("confirmed_ever") and self.memory_ttl_s > 0.0) else self.max_track_idle_s
+                if idle_s > ttl_limit:
+                    expired.append(tid)
             for tid in expired:
                 del self._tracks[tid]
 
-            # 5. Roll out 0.5s - 3.0s future horizons for each object
+            # 5. Roll out 0.5s - 3.0s future horizons for each currently visible object
             enriched_objects = []
             boxes_1s, boxes_2s, boxes_3s = [], [], []
             min_ttc_s = None
@@ -763,8 +1509,12 @@ class TrajectoryPredictor:
                 enriched = {
                     **cand["obj"],
                     "track_id": trk["track_id"],
+                    "category": trk.get("category", "obstacle"),
                     "hits": trk["hits"],
                     "realistic": is_realistic,
+                    "remembered": False,
+                    "in_memory": False,
+                    "memory_age_s": 0.0,
                     "realism_reason": trk["realism_reason"],
                     "velocity_px_s": [round(trk["vx"], 1), round(trk["vy"], 1)],
                     "norm_speed": trk["norm_speed"],
@@ -780,6 +1530,79 @@ class TrajectoryPredictor:
                 }
                 enriched_objects.append(enriched)
 
+            # 6. Update & project Persistent Spatial Memory tracks (confirmed objects currently occluded or out of FOV)
+            remembered_objects = []
+            memory_boxes = []
+            if self.memory_ttl_s > 0.0:
+                for t_id, trk in self._tracks.items():
+                    if t_id in matched_tracks or not trk.get("confirmed_ever"):
+                        continue
+                    mem_age_s = round(now - trk["last_seen"], 2)
+                    if mem_age_s <= 0.0 or mem_age_s > self.memory_ttl_s:
+                        continue
+
+                    # Apply ego-motion head-turn compensation & gentle coasting for dynamic targets
+                    coast_factor = math.exp(-mem_age_s * 1.4) if trk.get("dynamic") else 0.0
+                    trk["cx"] = trk["cx"] - ego_vx * dt_global + trk["vx"] * dt_global * coast_factor
+                    trk["cy"] = trk["cy"] + trk["vy"] * dt_global * coast_factor
+                    trk["vx"] *= (0.85 if trk.get("dynamic") else 0.2)
+                    trk["vy"] *= (0.85 if trk.get("dynamic") else 0.2)
+
+                    if trk.get("ground_xy"):
+                        rotated_gxy = self._rotate_ground_xy(trk["ground_xy"], delta_yaw_rad)
+                        if trk.get("dynamic") and mem_age_s <= 2.0:
+                            rotated_gxy = [
+                                round(rotated_gxy[0] + trk.get("gvx", 0.0) * dt_global * coast_factor, 3),
+                                round(max(0.15, rotated_gxy[1] + trk.get("gvy", 0.0) * dt_global * coast_factor), 3),
+                            ]
+                        trk["ground_xy"] = rotated_gxy
+                        trk["depth_m"] = round(math.hypot(rotated_gxy[0], rotated_gxy[1]), 2)
+
+                    decay = math.exp(-mem_age_s / max(1.0, 0.65 * self.memory_ttl_s))
+                    mem_conf = round(max(0.15, trk["confidence"] * decay), 3)
+                    mem_box = self._state_to_box(trk["cx"], trk["cy"], trk["w"], trk["h"], width, height)
+                    mem_z_idx = int(max(0, min(5, (trk["cx"] / width) * 6)))
+                    mem_z_name = ZONE_NAMES[mem_z_idx]
+                    mem_z3_name = THREE_ZONE_NAMES[mem_z_idx // 2]
+
+                    if mem_age_s <= 4.0:
+                        memory_boxes.append((mem_box[0], mem_box[2]))
+
+                    remembered_objects.append({
+                        "track_id": trk["track_id"],
+                        "class": trk["class"],
+                        "category": trk.get("category", "obstacle"),
+                        "confidence": trk["confidence"],
+                        "memory_confidence": mem_conf,
+                        "xyxy": mem_box,
+                        "ground_xy": trk.get("ground_xy"),
+                        "depth_m": trk.get("depth_m"),
+                        "position_kind": "spatial_memory",
+                        "hits": trk["hits"],
+                        "realistic": True,
+                        "remembered": True,
+                        "in_memory": True,
+                        "memory_age_s": mem_age_s,
+                        "memory_ttl_s": self.memory_ttl_s,
+                        "realism_reason": "spatial_memory_persistence",
+                        "velocity_px_s": [round(trk["vx"], 1), round(trk["vy"], 1)],
+                        "norm_speed": trk["norm_speed"],
+                        "metric_speed_mps": trk["metric_speed_mps"],
+                        "approaching": False,
+                        "ttc_s": None,
+                        "current_zone": mem_z_name,
+                        "predicted_zone_2s": mem_z_name,
+                        "current_zone_3": mem_z3_name,
+                        "predicted_zone_3_2s": mem_z3_name,
+                        "predicted_boxes": {},
+                        "predicted_path": [],
+                    })
+
+            # 7. Step Tesla BEV Log-Odds Grid + Waymo Occupancy Flow & Raycast Free-Space Clearing
+            free_space_contour = self._step_bev_occupancy_and_raycast(
+                enriched_objects, width, now, dt_global, delta_yaw_rad
+            )
+
             pred_zones_1s = zone_states(boxes_1s, width, self.boundaries)
             pred_zones_2s = zone_states(boxes_2s, width, self.boundaries)
             pred_zones_3s = zone_states(boxes_3s, width, self.boundaries)
@@ -790,6 +1613,9 @@ class TrajectoryPredictor:
             pred_zones_3_1s = six_to_three_zones(pred_zones_1s)
             pred_zones_3_2s = six_to_three_zones(pred_zones_2s)
             pred_zones_3_3s = six_to_three_zones(pred_zones_3s)
+
+            mem_zones_6 = zone_states(curr_boxes + memory_boxes, width, self.boundaries)
+            mem_zones_3 = six_to_three_zones(mem_zones_6)
 
             # Record keyframe snapshot for t-2s, t-1s, t0 temporal strip
             kf_tracks = []
@@ -821,7 +1647,14 @@ class TrajectoryPredictor:
                 realism_score = 1.0
                 realistic_scene = True
                 risk_level = "clear"
-                summary = "SCENE CLEAR · No obstacles projected in 3.0s horizon."
+                if remembered_objects:
+                    mem_summary = ", ".join(
+                        f"{r['class']} ({r['current_zone']}, {r['memory_age_s']:.1f}s ago)"
+                        for r in remembered_objects[:3]
+                    )
+                    summary = f"SPATIAL MEMORY ACTIVE · {len(remembered_objects)} remembered obstacle(s): {mem_summary}"
+                else:
+                    summary = "SCENE CLEAR · No obstacles projected in 3.0s horizon."
             else:
                 realism_score = round(realistic_count / float(total_obs), 2)
                 realistic_scene = realistic_count > 0 and not ego_motion_detected
@@ -860,11 +1693,13 @@ class TrajectoryPredictor:
                     reason_str = "Camera pan / head turn compensated" if ego_motion_detected else "Transient sensor noise filtered"
                     summary = f"UNREALISTIC MOTION FILTERED · {reason_str} ({filtered_count}/{total_obs} suppressed)."
                 elif forecast_notes:
-                    summary = "3S FORECAST · " + " | ".join(forecast_notes[:2])
+                    mem_suffix = f" · +{len(remembered_objects)} in memory" if remembered_objects else ""
+                    summary = "3S FORECAST · " + " | ".join(forecast_notes[:2]) + mem_suffix
                 else:
                     active_names_3 = [THREE_ZONE_NAMES[i] for i, z in enumerate(pred_zones_3_2s) if z == 1]
                     z_str = ", ".join(active_names_3) if active_names_3 else "none"
-                    summary = f"REALISTIC STABLE SCENE · {realistic_count} confirmed target(s) · 3-motor zones: [{z_str}]"
+                    mem_suffix = f" (+{len(remembered_objects)} in spatial memory)" if remembered_objects else ""
+                    summary = f"REALISTIC STABLE SCENE · {realistic_count} confirmed target(s){mem_suffix} · 3-motor zones: [{z_str}]"
 
             rec_3 = [
                 1 if (pred_zones_3_1s[i] == 1 or pred_zones_3_2s[i] == 1) else 0
@@ -875,18 +1710,69 @@ class TrajectoryPredictor:
                 for i in range(6)
             ] if realistic_scene else [0, 0, 0, 0, 0, 0]
 
+            occupancy_cells = [
+                {
+                    **cell,
+                    "age_s": round(now - cell["last_seen"], 2),
+                }
+                for cell in self._occupancy_grid.values()
+            ]
+
+            # Build compact per-track geometry table for the GX10 Local Model Depth Reasoner
+            active_tracks_summary = []
+            max_observed_dist_m = 4.5
+            for obj in enriched_objects:
+                if not obj.get("realistic", True):
+                    continue
+                xyxy = obj.get("xyxy", [0, 0, 10, 10])
+                bh = max(4.0, float(xyxy[3]) - float(xyxy[1]))
+                dm = obj.get("depth_m")
+                if dm is not None:
+                    max_observed_dist_m = max(max_observed_dist_m, float(dm))
+                active_tracks_summary.append({
+                    "track_id": obj.get("track_id"),
+                    "class": obj.get("class", "person"),
+                    "xyxy": [round(float(v), 1) for v in xyxy],
+                    "foot_y_pct": round(float(xyxy[3]) / max(1.0, float(height)), 2),
+                    "box_h_pct": round(bh / max(1.0, float(height)), 2),
+                    "fast_depth_m": dm,
+                    "ground_xy": obj.get("ground_xy"),
+                    "zone_3": obj.get("current_zone_3", "CENTER"),
+                })
+            for rem in remembered_objects:
+                dm = rem.get("depth_m")
+                if dm is not None:
+                    max_observed_dist_m = max(max_observed_dist_m, float(dm))
+
+            # Dynamic radar max range (meters): adapts to farthest target or VLM-verified scene scale
+            auto_range_m = max(7.0, min(14.0, math.ceil((max_observed_dist_m + 1.2) * 2.0) / 2.0))
+            if self._vlm_recommended_range_m is not None:
+                radar_max_range_m = round(max(auto_range_m, self._vlm_recommended_range_m), 1)
+            else:
+                radar_max_range_m = round(auto_range_m, 1)
+
             predict_ms = round((time.perf_counter() - t0) * 1000.0, 3)
             scenario = {
                 "realistic": realistic_scene,
                 "realistic_detection": realistic_scene,
                 "realism_score": realism_score,
                 "ego_motion_detected": ego_motion_detected,
+                "ego_yaw_delta_deg": round(math.degrees(delta_yaw_rad), 2),
                 "risk_level": risk_level,
                 "motion_trend": motion_trend,
                 "min_ttc_s": min_ttc_s,
                 "confirmed_tracks": realistic_count,
                 "filtered_anomalies": filtered_count,
+                "remembered_count": len(remembered_objects),
+                "remembered_objects": remembered_objects,
+                "memory_ttl_s": self.memory_ttl_s,
+                "occupancy_cells": occupancy_cells,
+                "free_space_contour": free_space_contour,
+                "radar_max_range_m": radar_max_range_m,
+                "active_tracks_summary": active_tracks_summary,
+                "vlm_depth_report": dict(self._vlm_depth_report) if self._vlm_depth_report else None,
                 "zones_3": curr_zones_3,
+                "memory_zones_3": mem_zones_3,
                 "predicted_zones_3_1s": pred_zones_3_1s,
                 "predicted_zones_3_2s": pred_zones_3_2s,
                 "predicted_zones_3_3s": pred_zones_3_3s,
@@ -920,23 +1806,103 @@ class TrajectoryPredictor:
         return out
 
 
+GX10_OLLAMA_MODELS = (
+    "gemma4:26b",
+    "qwen3.6:35b",
+    "nemotron3:33b",
+    "nemotron-3-super:latest",
+)
+
+
 class DecisionForecaster:
-    """Asynchronous System-1 Decision Layer for 3-Second Hazard & 3-Motor Haptic Arbitration.
+    """Asynchronous System-1 Decision Layer + System-2 GX10 Depth & Spatial Map Reasoner.
 
     Supports:
+    - `gemma4:26b` / `qwen3.6:35b` / `nemotron3:33b` / `nemotron-3-super:latest`: Local GX10 Ollama
+      Vision/Language Models running on the 128 GB RAM GX10 GPU (`http://127.0.0.1:11434`).
+      Also performs asynchronous Depth & Spatial Map Verification to double-check fast monocular
+      depths and update the BEV radar map.
     - `laya`: Local open-source `convaiinnovations/laya` decision model (Apache 2.0, ~421M ModernBERT
       with bidirectional option-order de-biasing, ~50–100 ms on MPS/CUDA, 100% offline).
     - `jev`: Hosted TypeSafe AI `POST https://api.typesafe.ai/v1/systemone` endpoint using the key in
       `private/jev_api_key.txt` or `JEV_API_KEY` environment variable.
     - `kinematic`: Zero-weight deterministic fallback.
 
-    Runs in a non-blocking background thread in live mode so it never blocks YOLO26n.
+    Runs in a non-blocking background thread in live mode so it never blocks YOLO.
     """
 
     LAYA_MODEL_ID = "convaiinnovations/laya"
     LAYA_REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"
     JEV_API_URL = "https://api.typesafe.ai/v1/systemone"
     JEV_MODEL = "jev-latest"
+    DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+
+    # Models installed on the 128 GB RAM ASUS Ascent GX10 (`ollama list`)
+    GX10_OLLAMA_MODELS = GX10_OLLAMA_MODELS
+    GX10_VISION_OLLAMA_MODELS = (
+        "gemma4:26b",
+        "qwen3.6:35b",
+        "nemotron3:33b",
+    )
+    VALID_BACKENDS = (
+        "auto",
+        "laya",
+        "jev",
+        "kinematic",
+        "ollama",
+        "gemma4:26b",
+        "qwen3.6:35b",
+        "nemotron3:33b",
+        "nemotron-3-super:latest",
+    )
+
+    OLLAMA_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "hazard_choice": {
+                "type": "string",
+                "enum": [
+                    "approaching_center",
+                    "crossing_left_to_center",
+                    "crossing_right_to_center",
+                    "left_obstacle",
+                    "right_obstacle",
+                    "unrealistic_or_clear",
+                ],
+            },
+            "confidence": {"type": "number"},
+            "scene_scale_factor": {"type": "number"},
+            "horizon_ratio": {"type": "number"},
+            "recommended_radar_range_m": {"type": "number"},
+            "track_depths": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "track_id": {"type": "integer"},
+                        "verified_depth_m": {"type": "number"},
+                        "verified_x_m": {"type": "number"},
+                    },
+                    "required": ["track_id", "verified_depth_m"],
+                },
+            },
+            "scene_obstacles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "zone": {"type": "string", "enum": ["LEFT", "CENTER", "RIGHT"]},
+                        "distance_m": {"type": "number"},
+                    },
+                    "required": ["name", "zone", "distance_m"],
+                },
+            },
+            "depth_reasoning": {"type": "string"},
+            "guidance": {"type": "string"},
+        },
+        "required": ["hazard_choice", "confidence", "scene_obstacles", "guidance"],
+    }
 
     INSTRUCTIONS = (
         "Select the matching obstacle state and 3-motor haptic zone alert from the 3-second camera observation."
@@ -995,22 +1961,34 @@ class DecisionForecaster:
     }
 
     def __init__(self, backend="auto", device="auto", jev_key_file="private/jev_api_key.txt",
-                 jev_url=None, jev_model=None, interval_s=0.35, timeout_s=2.5):
+                 jev_url=None, jev_model=None, ollama_url=None, on_vlm_obstacles=None,
+                 on_vlm_depth_calibration=None, enable_bg_depth_verifier=False,
+                 depth_verifier_model="gemma4:26b",
+                 interval_s=0.35, timeout_s=2.5, ollama_timeout_s=15.0):
         self.requested_backend = backend
         self.device = device
         self.jev_key_file = Path(jev_key_file) if jev_key_file else None
         self.jev_url = (jev_url or os.environ.get("JEV_API_URL") or self.JEV_API_URL).rstrip("/")
         self.jev_model = (jev_model or os.environ.get("JEV_MODEL") or self.JEV_MODEL).strip()
+        self.ollama_url = (ollama_url or os.environ.get("OLLAMA_URL") or self.DEFAULT_OLLAMA_URL).rstrip("/")
+        self.on_vlm_obstacles = on_vlm_obstacles
+        self.on_vlm_depth_calibration = on_vlm_depth_calibration
+        self.enable_bg_depth_verifier = bool(enable_bg_depth_verifier)
+        self.depth_verifier_model = depth_verifier_model
         self.interval_s = float(interval_s)
         self.timeout_s = float(timeout_s)
+        self.ollama_timeout_s = float(ollama_timeout_s)
         self._lock = threading.Lock()
         self._infer_lock = threading.Lock()
         self._laya_agent = None
         self._laya_error = None
         self._latest_input = None
+        self._latest_jpeg = None
         self._latest_decision = None
+        self._latest_depth_verification = None
         self._stop = threading.Event()
         self._thread = None
+        self._depth_thread = None
 
     def _read_jev_key(self):
         env_key = (os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY") or "").strip()
@@ -1026,8 +2004,8 @@ class DecisionForecaster:
         return None
 
     def set_backend(self, backend):
-        if backend not in ("auto", "laya", "jev", "kinematic"):
-            raise ValueError("Decision backend must be auto, laya, jev, or kinematic")
+        if backend not in self.VALID_BACKENDS:
+            raise ValueError(f"Decision backend must be one of {self.VALID_BACKENDS}")
         with self._lock:
             self.requested_backend = backend
 
@@ -1184,6 +2162,104 @@ class DecisionForecaster:
             "jev_key_configured": bool(self._read_jev_key()),
         }
 
+    def _run_ollama(self, model_name, state_text, jpeg_bytes=None, scenario=None):
+        """Run one of the GX10's local Ollama models (`gemma4:26b`, `qwen3.6:35b`, `nemotron3:33b`, `nemotron-3-super:latest`).
+        Vision-capable models receive the live camera JPEG, the 3-keyframe BEV trajectory telemetry, AND the
+        bounding-box/depth table (`active_tracks_summary`) to double-check and calibrate target distances."""
+        resolved_model = "gemma4:26b" if model_name == "ollama" else model_name
+        is_vision = resolved_model in self.GX10_VISION_OLLAMA_MODELS
+        tracks_table = (scenario or {}).get("active_tracks_summary") or []
+        tracks_json = json.dumps(tracks_table[:6])
+        prompt = (
+            "You are the GX10 Spatial Perception, Depth Verifier & Haptic Navigation Copilot for a blind/low-vision wearable.\n"
+            f"3-second BEV trajectory telemetry: {state_text}\n"
+            f"Tracked targets with fast monocular depth estimates (foot_y_pct=1.0 is bottom of frame/closest, 0.0 is top/farthest): {tracks_json}\n"
+            "Double-check the target distances based on camera perspective, ground contact (foot_y_pct), and box height (box_h_pct), "
+            "then return JSON with:\n"
+            "- hazard_choice (approaching_center, crossing_left_to_center, crossing_right_to_center, left_obstacle, right_obstacle, unrealistic_or_clear)\n"
+            "- confidence (0.0 to 1.0)\n"
+            "- scene_scale_factor (0.5 to 1.5 multiplier to correct fast depth estimates for camera elevation/perspective)\n"
+            "- horizon_ratio (0.06 to 0.45 vertical horizon position in frame)\n"
+            "- recommended_radar_range_m (6.0 for indoor close, 8.0-12.0 for wide/outdoor scenes so all targets fit inside the radar)\n"
+            "- track_depths (array of {track_id, verified_depth_m, verified_x_m} with corrected metric distance in meters for each tracked target)\n"
+            "- scene_obstacles (array of {name, zone: LEFT|CENTER|RIGHT, distance_m})\n"
+            "- depth_reasoning (1 concise sentence explaining your depth double-check)\n"
+            "- guidance (concise 1-sentence navigation cue)"
+        )
+        msg = {"role": "user", "content": prompt}
+        if is_vision and jpeg_bytes:
+            msg["images"] = [base64.b64encode(jpeg_bytes).decode("ascii")]
+
+        payload = {
+            "model": resolved_model,
+            "messages": [msg],
+            "format": self.OLLAMA_SCHEMA,
+            "think": False,
+            "stream": False,
+            "keep_alive": "30m",
+            "options": {"temperature": 0, "num_predict": 240},
+        }
+        req = urllib.request.Request(
+            f"{self.ollama_url}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.ollama_timeout_s) as resp:
+            body = json.load(resp)
+        content = (body.get("message") or {}).get("content") or "{}"
+        parsed = json.loads(content)
+        choice = parsed.get("hazard_choice", "approaching_center")
+        if choice not in self.TREND_TO_3ZONES:
+            choice = "approaching_center"
+        conf = max(0.5, min(0.99, float(parsed.get("confidence", 0.92))))
+        z3 = self.TREND_TO_3ZONES.get(choice, [0, 0, 0])
+        motor_probs = [round(conf if v else (1.0 - conf) * 0.25, 3) for v in z3]
+        probs = {k: (round(conf, 3) if k == choice else round((1.0 - conf) / 5.0, 4)) for k in self.TREND_TO_3ZONES}
+        vlm_obstacles = parsed.get("scene_obstacles") or []
+        if vlm_obstacles and callable(self.on_vlm_obstacles):
+            try:
+                self.on_vlm_obstacles(vlm_obstacles)
+            except Exception:
+                pass
+
+        # Apply asynchronous VLM depth double-check & BEV map calibration
+        track_depths = parsed.get("track_depths") or []
+        scale_factor = parsed.get("scene_scale_factor")
+        horizon_ratio = parsed.get("horizon_ratio")
+        rec_range_m = parsed.get("recommended_radar_range_m")
+        depth_reasoning = str(parsed.get("depth_reasoning") or "").strip()
+        depth_cal = {
+            "model": resolved_model,
+            "model_name": resolved_model,
+            "scene_scale_factor": scale_factor,
+            "horizon_ratio": horizon_ratio,
+            "recommended_radar_range_m": rec_range_m,
+            "track_depths": track_depths,
+            "depth_reasoning": depth_reasoning,
+            "updated_at": time.monotonic(),
+        }
+        with self._lock:
+            self._latest_depth_verification = depth_cal
+        if callable(self.on_vlm_depth_calibration):
+            try:
+                self.on_vlm_depth_calibration(depth_cal)
+            except Exception:
+                pass
+
+        return {
+            "backend": resolved_model,
+            "model": resolved_model,
+            "choice": choice,
+            "confidence": round(conf, 3),
+            "probabilities": probs,
+            "motor_probabilities_3": motor_probs,
+            "vlm_obstacles": vlm_obstacles,
+            "vlm_guidance": str(parsed.get("guidance") or "").strip(),
+            "vlm_depth_verification": depth_cal,
+            "jev_key_configured": bool(self._read_jev_key()),
+        }
+
     def _run_jev(self, state_text):
         api_key = self._read_jev_key()
         if not api_key:
@@ -1236,16 +2312,24 @@ class DecisionForecaster:
             "jev_key_configured": True,
         }
 
-    def evaluate_sync(self, scenario):
+    def evaluate_sync(self, scenario, jpeg_bytes=None):
         """Evaluate the 3-keyframe scenario synchronously and return the structured decision JSON."""
         t0 = time.perf_counter()
         state_text = self.build_keyframe_state_text(scenario)
         with self._lock:
             req_backend = self.requested_backend
+            if jpeg_bytes is None:
+                jpeg_bytes = self._latest_jpeg
 
         raw_decision = None
         fallback_note = None
-        if req_backend == "jev":
+        if req_backend in ("ollama",) + self.GX10_OLLAMA_MODELS:
+            try:
+                raw_decision = self._run_ollama(req_backend, state_text, jpeg_bytes=jpeg_bytes, scenario=scenario)
+            except Exception as exc:
+                fallback_note = f"GX10 Ollama ({req_backend}) unreachable ({type(exc).__name__}), using Laya fallback"
+                raw_decision = self._run_laya(state_text)
+        elif req_backend == "jev":
             try:
                 raw_decision = self._run_jev(state_text)
                 if raw_decision is None:
@@ -1280,17 +2364,21 @@ class DecisionForecaster:
             }
 
         choice = raw_decision["choice"]
-        realistic_detection = bool(choice != "unrealistic_or_clear" and kin_realistic)
+        vlm_guidance = raw_decision.get("vlm_guidance")
+        vlm_obstacles = raw_decision.get("vlm_obstacles") or []
+        realistic_detection = bool(choice != "unrealistic_or_clear" and (kin_realistic or bool(vlm_obstacles)))
         zones_3 = list(self.TREND_TO_3ZONES.get(choice, [0, 0, 0]))
-        if realistic_detection and confirmed > 0 and sum(zones_3) == 0:
+        if realistic_detection and (confirmed > 0 or vlm_obstacles) and sum(zones_3) == 0:
             zones_3 = list(scenario.get("recommended_pre_alert_zones_3") or [0, 1, 0])
-        elif not realistic_detection or confirmed == 0:
+        elif not realistic_detection or (confirmed == 0 and not vlm_obstacles):
             zones_3 = [0, 0, 0]
 
         zones_6 = three_to_six_zones(zones_3)
         haptic_pattern = self.TREND_TO_HAPTIC_PATTERN.get(choice, "silent") if realistic_detection else "silent"
 
-        if not realistic_detection:
+        if vlm_guidance:
+            predicted_next_3s = f"{vlm_guidance} → motors {zones_3}"
+        elif not realistic_detection:
             predicted_next_3s = "Unrealistic motion / head-turn filtered; all 3 haptic motors suppressed [0, 0, 0]."
         elif confirmed == 0:
             predicted_next_3s = "Forward corridor clear over next 3.0s; 3 haptic motors idle [0, 0, 0]."
@@ -1308,6 +2396,9 @@ class DecisionForecaster:
         else:
             predicted_next_3s = "Confirmed obstacle on Right side → pre-alert RIGHT motor [0, 0, 1]"
 
+        with self._lock:
+            latest_depth_ver = raw_decision.get("vlm_depth_verification") or self._latest_depth_verification
+
         decision_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         result = {
             "realistic_detection": realistic_detection,
@@ -1322,6 +2413,10 @@ class DecisionForecaster:
             "backend": raw_decision["backend"],
             "requested_backend": req_backend,
             "model": raw_decision["model"],
+            "vlm_obstacles": vlm_obstacles,
+            "vlm_guidance": vlm_guidance,
+            "vlm_depth_verification": latest_depth_ver,
+            "depth_reasoning": (latest_depth_ver or {}).get("depth_reasoning", "") if isinstance(latest_depth_ver, dict) else "",
             "jev_key_configured": raw_decision["jev_key_configured"],
             "fallback_note": fallback_note,
             "state_prompt": state_text,
@@ -1336,15 +2431,23 @@ class DecisionForecaster:
         if self._thread is None:
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
+        if self.enable_bg_depth_verifier and self._depth_thread is None:
+            self._depth_thread = threading.Thread(target=self._depth_verifier_loop, daemon=True)
+            self._depth_thread.start()
 
     def stop(self):
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=0.5)
+        if self._depth_thread:
+            self._depth_thread.join(timeout=0.5)
 
     def submit(self, kinematic_scenario, jpeg_bytes=None):
         with self._lock:
             self._latest_input = dict(kinematic_scenario)
+            self._latest_depth_scenario = dict(kinematic_scenario)
+            if jpeg_bytes is not None:
+                self._latest_jpeg = jpeg_bytes
 
     def latest(self):
         with self._lock:
@@ -1354,17 +2457,48 @@ class DecisionForecaster:
         while not self._stop.is_set():
             with self._lock:
                 scenario = self._latest_input
+                jpeg_bytes = self._latest_jpeg
                 self._latest_input = None
             if scenario is None:
                 self._stop.wait(0.08)
                 continue
             try:
-                self.evaluate_sync(scenario)
+                self.evaluate_sync(scenario, jpeg_bytes=jpeg_bytes)
             except Exception:
                 pass
             self._stop.wait(self.interval_s)
 
+    def _depth_verifier_loop(self):
+        """Asynchronous System-2 GX10 Local VLM loop that runs every ~2.5s in the background when
+        a fast System-1 backend (like Laya or Kinematic) is selected, double-checking object depths
+        and updating the BEV spatial map around the wearer without blocking real-time haptics."""
+        while not self._stop.is_set():
+            with self._lock:
+                req_backend = self.requested_backend
+                scenario = getattr(self, "_latest_depth_scenario", None)
+                jpeg_bytes = self._latest_jpeg
+            # If req_backend is already an Ollama VLM, _loop already runs _run_ollama
+            if req_backend in ("ollama",) + self.GX10_OLLAMA_MODELS or scenario is None:
+                self._stop.wait(1.0)
+                continue
+            if not (scenario.get("active_tracks_summary") or scenario.get("confirmed_tracks")):
+                self._stop.wait(0.8)
+                continue
+            try:
+                state_text = self.build_keyframe_state_text(scenario)
+                self._run_ollama(
+                    self.depth_verifier_model,
+                    state_text,
+                    jpeg_bytes=jpeg_bytes,
+                    scenario=scenario,
+                )
+            except Exception:
+                pass
+            self._stop.wait(2.5)
+
 
 # Keep alias for backwards compatibility
 AsyncVLMForecaster = DecisionForecaster
+
+
 

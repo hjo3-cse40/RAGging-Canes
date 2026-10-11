@@ -67,12 +67,35 @@
                 <option value="3">4× Smooth (3 mid)</option>
               </select>
             </label>
-            <label class="toggle" title="System-1 Decision Model for 3s hazard & 3-motor haptics">
+            <label class="toggle" title="Local GX10 GPU object detector model">
+              <span class="control-label">Detector:</span>
+              <select id="model-select" class="select-input" aria-label="Object detector model">
+                <option value="auto" selected>GX10 Auto (YOLOv8L-Worldv2)</option>
+                <option value="yolov8l-worldv2.pt">YOLOv8L-Worldv2 (Open-Vocab 90MB)</option>
+                <option value="yolo26x.pt">YOLO26x (Extra-Large 113MB)</option>
+                <option value="yolo26l.pt">YOLO26l (Large 51MB)</option>
+                <option value="yolov8s-worldv2.pt">YOLOv8s-Worldv2 (Fast 25MB)</option>
+                <option value="yolo26n.pt">YOLO26n (Nano 5.5MB)</option>
+              </select>
+            </label>
+            <label class="toggle" title="GX10 Local Ollama VLM / System-1 Decision Model for 3s hazard & 3-motor haptics">
               <span class="control-label">Decision:</span>
               <select id="decision-select" class="select-input" aria-label="Decision model backend">
-                <option value="laya" selected>Laya (Local Open-Source)</option>
+                <option value="gemma4:26b">GX10 Gemma4:26B (Local VLM)</option>
+                <option value="qwen3.6:35b">GX10 Qwen3.6:35B (Local VLM)</option>
+                <option value="nemotron3:33b">GX10 Nemotron3:33B (Omni VLM)</option>
+                <option value="nemotron-3-super:latest">GX10 Nemotron-3-Super (124B)</option>
+                <option value="laya" selected>Laya (Local System-1)</option>
                 <option value="jev">Jev API (TypeSafe)</option>
                 <option value="kinematic">Kinematic Only</option>
+              </select>
+            </label>
+            <label class="toggle" title="Obstacle class preset for indoor/walkway navigation">
+              <span class="control-label">Classes:</span>
+              <select id="classes-select" class="select-input" aria-label="Obstacle class preset">
+                <option value="indoor_nav" selected>16+ Indoor Hazards</option>
+                <option value="full_surround">Full Open-Vocab (22+)</option>
+                <option value="core">Person &amp; Chair Only</option>
               </select>
             </label>
             <label class="toggle">
@@ -91,20 +114,23 @@
         </div>
         <div class="camera-footer">
           <span id="resolution">—</span>
-          <span id="classes">YOLO26N + LAYA/JEV DECISION + 3-MOTOR HAPTICS</span>
+          <span id="classes">GX10 YOLOV8L-WORLDV2 + DEPTH-ANYTHING-V2 + OLLAMA VLM + TESLA BEV MEMORY</span>
         </div>
         <div class="zones-head">
-          <span>3-MOTOR HAPTIC MVP (SOLID = VIBRATE NOW · DASHED = LAYA/JEV +3S PRE-ALERT)</span>
+          <span>3-MOTOR HAPTIC MVP (SOLID = VIBRATE NOW · DASHED = GX10 VLM/LAYA +3S PRE-ALERT)</span>
           <span id="haptic-pattern-tag">LEFT · CENTER · RIGHT</span>
         </div>
         <div class="zones zones-3" id="zones-3"></div>
         <div class="decision-strip" id="decision-forecast">
           <div class="decision-toggle-group" id="decision-toggle-group" role="group" aria-label="Decision model toggle">
+            <button type="button" class="decision-pill" data-backend="gemma4:26b" id="btn-decision-gemma4">🧠 Gemma4:26B</button>
+            <button type="button" class="decision-pill" data-backend="qwen3.6:35b" id="btn-decision-qwen3">👁️ Qwen3.6:35B</button>
+            <button type="button" class="decision-pill" data-backend="nemotron3:33b" id="btn-decision-nemotron3">🟢 Nemotron3:33B</button>
             <button type="button" class="decision-pill active" data-backend="laya" id="btn-decision-laya">⚡ Local Laya</button>
             <button type="button" class="decision-pill" data-backend="jev" id="btn-decision-jev">☁️ Jev API</button>
             <button type="button" class="decision-pill" data-backend="kinematic" id="btn-decision-kinematic">📐 Kinematic</button>
           </div>
-          <span class="decision-tag" id="decision-model-tag">LAYA SYSTEM-1</span>
+          <span class="decision-tag" id="decision-model-tag">GX10 DECISION</span>
           <span class="decision-text" id="decision-text">Evaluating 3-keyframe (t-2s, t-1s, t0) trajectory state…</span>
         </div>
         <div class="zones-head sub-zones-head">
@@ -118,21 +144,42 @@
       <section class="panel map-panel">
         <div class="panel-head">
           <div>
-            <span class="eyebrow">02 / TOP-DOWN SURROUND VIEW</span>
+            <span class="eyebrow">02 / TESLA BEV + WAYMO OCCUPANCY FLOW</span>
             <h2 id="map-title">Surrounding radar</h2>
           </div>
-          <span class="small-tag" id="map-badge">SURROUND RADAR</span>
+          <div class="panel-controls">
+            <label class="toggle" title="Tesla/Waymo persistent BEV spatial memory horizon across occlusions & head turns">
+              <span class="control-label">Memory:</span>
+              <select id="memory-select" class="select-input" aria-label="Spatial memory retention">
+                <option value="12" selected>12s BEV Memory</option>
+                <option value="20">20s Deep Map</option>
+                <option value="5">5s Short</option>
+                <option value="0">Off (Live Only)</option>
+              </select>
+            </label>
+            <label class="toggle" title="GX10 Monocular Metric Depth estimation without 4-point floor tape">
+              <span class="control-label">Depth:</span>
+              <select id="depth-select" class="select-input" aria-label="Monocular depth mode">
+                <option value="auto" selected>GX10 Auto Depth (m)</option>
+                <option value="pinhole">Geometric Metric</option>
+                <option value="neural">Depth-Anything V2</option>
+                <option value="off">4-Pt Calib Only</option>
+              </select>
+            </label>
+            <span class="small-tag" id="map-badge">BEV METRIC MAP</span>
+          </div>
         </div>
         <div class="map-stage">
           <canvas id="map" width="700" height="540" aria-label="Top-down Tesla-style surround perception view"></canvas>
         </div>
         <div class="legend">
           <span><i class="dot mint"></i>Person</span>
-          <span><i class="dot amber"></i>Chair / Obstacle</span>
-          <span><i class="dot forecast-dot"></i>3s Predicted Path</span>
-          <span><i class="dot outline"></i>Sensor Perimeter</span>
+          <span><i class="dot amber"></i>Obstacle / Hazard</span>
+          <span><i class="dot memory-dot"></i>Remembered (Occluded)</span>
+          <span><i class="dot voxel-dot"></i>BEV Voxel + Flow</span>
+          <span><i class="dot freespace-dot"></i>Walkable Corridor</span>
         </div>
-        <p id="map-note" class="map-note">Continuous surrounding perception view. Distance, 3-second trajectories, and realism filter update in real time.</p>
+        <p id="map-note" class="map-note">Tesla BEV log-odds occupancy grid + Waymo 2D velocity flow &amp; raycast occlusion memory.</p>
       </section>
     </div>
 

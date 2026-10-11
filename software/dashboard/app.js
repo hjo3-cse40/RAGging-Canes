@@ -83,13 +83,14 @@ class Tracker {
     // Convert detected objects to map target coordinates
     const candidates = detectedObjects.map(obj => {
       let tx, ty, distStr;
+      const frameW = displayed?.width || 640;
       if (isMetric && obj.ground_xy) {
         tx = ox + obj.ground_xy[0] * sx;
         ty = oy - obj.ground_xy[1] * sy;
         const dist = Math.hypot(obj.ground_xy[0], obj.ground_xy[1]);
         distStr = `${dist.toFixed(1)} m`;
       } else {
-        const u = (obj.xyxy[0] + obj.xyxy[2]) / 2 / (displayed?.width || 640);
+        const u = (obj.xyxy[0] + obj.xyxy[2]) / 2 / frameW;
         const a = start + (end - start) * u;
         const distRadius = 220; // default bearing arc
         tx = ox + Math.cos(a) * distRadius;
@@ -98,13 +99,41 @@ class Tracker {
         const zoneNames = ['L3', 'L2', 'L1', 'R1', 'R2', 'R3'];
         distStr = zoneNames[Math.max(0, Math.min(5, zoneIdx))];
       }
+
+      // Compute future radar points from 0.5s - 3.0s predicted_path
+      const futureRadarPts = (obj.predicted_path || []).map(pt => {
+        if (isMetric && pt.ground_xy) {
+          return {
+            dt: pt.dt,
+            x: ox + pt.ground_xy[0] * sx,
+            y: oy - pt.ground_xy[1] * sy
+          };
+        }
+        const uFut = Math.max(0, Math.min(1, pt.cx / frameW));
+        const aFut = start + (end - start) * uFut;
+        const approachShift = obj.approaching ? Math.min(85, pt.dt * 26) : 0;
+        const radFut = Math.max(65, 220 - approachShift);
+        return {
+          dt: pt.dt,
+          x: ox + Math.cos(aFut) * radFut,
+          y: oy + Math.sin(aFut) * radFut
+        };
+      });
+
       return {
         class: obj.class,
         confidence: obj.confidence,
         targetX: tx,
         targetY: ty,
         ground_xy: obj.ground_xy,
-        distStr
+        distStr,
+        realistic: obj.realistic !== false,
+        realism_reason: obj.realism_reason || 'confirmed',
+        ttc_s: obj.ttc_s,
+        approaching: !!obj.approaching,
+        current_zone: obj.current_zone,
+        predicted_zone_2s: obj.predicted_zone_2s,
+        futureRadarPts
       };
     });
 
@@ -128,6 +157,13 @@ class Tracker {
         bestTrack.ground_xy = c.ground_xy;
         bestTrack.distStr = c.distStr;
         bestTrack.confidence = c.confidence;
+        bestTrack.realistic = c.realistic;
+        bestTrack.realism_reason = c.realism_reason;
+        bestTrack.ttc_s = c.ttc_s;
+        bestTrack.approaching = c.approaching;
+        bestTrack.current_zone = c.current_zone;
+        bestTrack.predicted_zone_2s = c.predicted_zone_2s;
+        bestTrack.futureRadarPts = c.futureRadarPts;
         bestTrack.targetAlpha = 1;
         bestTrack.lastSeen = now;
         matched.add(bestTrack.id);
@@ -144,6 +180,13 @@ class Tracker {
           targetAlpha: 1,
           ground_xy: c.ground_xy,
           distStr: c.distStr,
+          realistic: c.realistic,
+          realism_reason: c.realism_reason,
+          ttc_s: c.ttc_s,
+          approaching: c.approaching,
+          current_zone: c.current_zone,
+          predicted_zone_2s: c.predicted_zone_2s,
+          futureRadarPts: c.futureRadarPts,
           lastSeen: now
         };
         this.tracks.push(newTrack);
@@ -181,8 +224,7 @@ const tracker = new Tracker();
 // RENDER: CAMERA FEED (TESLA AUTOPILOT HUD BRACKETS)
 // -------------------------------------------------------------
 function drawCamera() {
-  const isLive = state?.mode === 'live';
-  const hasStream = isLive && streamImg && streamImg.naturalWidth > 0;
+  const hasStream = !selecting && state?.status === 'live' && streamImg && streamImg.naturalWidth > 0;
   const currentImg = hasStream ? streamImg : photo;
   const hasImage = currentImg && currentImg.complete && currentImg.naturalWidth > 0;
 
@@ -230,14 +272,74 @@ function drawCamera() {
   }
   ctx.setLineDash([]);
 
+  const showForecast = $('forecast') ? $('forecast').checked : true;
+  const dtSinceRecv = (!selecting && state?.status === 'live' && receivedAt > 0)
+    ? Math.min(0.45, Math.max(0, (performance.now() - receivedAt) / 1000))
+    : 0;
+
   // Draw Detections if toggled
   if ($('boxes').checked && displayed.objects) {
     for (const o of displayed.objects) {
-      const [x1, y1, x2, y2] = o.xyxy;
+      const isRealistic = o.realistic !== false;
+      const vx = (isRealistic && o.velocity_px_s) ? o.velocity_px_s[0] * 0.65 : 0;
+      const vy = (isRealistic && o.velocity_px_s) ? o.velocity_px_s[1] * 0.65 : 0;
+      const dx = vx * dtSinceRecv;
+      const dy = vy * dtSinceRecv;
+      const x1 = Math.max(0, Math.min(camera.width - 8, o.xyxy[0] + dx));
+      const y1 = Math.max(0, Math.min(camera.height - 8, o.xyxy[1] + dy));
+      const x2 = Math.max(x1 + 8, Math.min(camera.width, o.xyxy[2] + dx));
+      const y2 = Math.max(y1 + 8, Math.min(camera.height, o.xyxy[3] + dy));
       const w = x2 - x1;
       const h = y2 - y1;
-      const color = o.class === 'chair' ? amber : cyan;
-      const glow = o.class === 'chair' ? amberGlow : cyanGlow;
+      const color = !isRealistic ? slate : (o.class === 'chair' ? amber : cyan);
+
+      // 3-Second Future Ghost Box & Trajectory Rollout
+      if (showForecast && isRealistic && o.predicted_boxes && o.predicted_path) {
+        const box2s = o.predicted_boxes['2.0s'];
+        if (box2s) {
+          const [gx1, gy1, gx2, gy2] = box2s;
+          const gw = gx2 - gx1;
+          const gh = gy2 - gy1;
+          if (Math.hypot(gx1 - x1, gy1 - y1) > 6) {
+            ctx.save();
+            ctx.setLineDash([5, 4]);
+            ctx.strokeStyle = o.approaching ? red : '#38bdf8';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(gx1, gy1, gw, gh);
+            ctx.fillStyle = o.approaching ? 'rgba(239, 68, 68, 0.06)' : 'rgba(56, 189, 248, 0.06)';
+            ctx.fillRect(gx1, gy1, gw, gh);
+            ctx.restore();
+          }
+        }
+
+        // Dotted 3-second foot trajectory vector
+        const footX = (x1 + x2) / 2;
+        const footY = y2;
+        ctx.save();
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = o.approaching ? red : '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(footX, footY);
+        for (const pt of o.predicted_path) {
+          ctx.lineTo(pt.foot_x, pt.foot_y);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (const pt of o.predicted_path) {
+          if (Math.hypot(pt.foot_x - footX, pt.foot_y - footY) > 5) {
+            ctx.fillStyle = o.approaching ? red : '#38bdf8';
+            ctx.beginPath();
+            ctx.arc(pt.foot_x, pt.foot_y, 3, 0, Math.PI * 2);
+            ctx.fill();
+            if (pt.dt === 1.0 || pt.dt === 3.0) {
+              ctx.font = '600 9px -apple-system, sans-serif';
+              ctx.fillText(`+${pt.dt}s`, pt.foot_x + 5, pt.foot_y - 3);
+            }
+          }
+        }
+        ctx.restore();
+      }
 
       // Translucent box fill
       ctx.fillStyle = o.class === 'chair' ? 'rgba(245, 158, 11, 0.08)' : 'rgba(0, 245, 212, 0.08)';
@@ -289,9 +391,17 @@ function drawCamera() {
       ctx.arc(footX, footY, 3.5, 0, Math.PI * 2);
       ctx.fill();
 
-      // High-tech HUD tag pill
-      const label = `${o.class.toUpperCase()} ${Math.round(o.confidence * 100)}%`;
+      // High-tech HUD tag pill with Realism + 2s Zone / TTC forecast
+      const extraTag = !isRealistic
+        ? ' · FILTERED'
+        : o.ttc_s != null
+          ? ` · TTC ${o.ttc_s.toFixed(1)}s`
+          : (o.current_zone && o.predicted_zone_2s && o.current_zone !== o.predicted_zone_2s)
+            ? ` · ${o.current_zone}→${o.predicted_zone_2s}`
+            : '';
+      const label = `${o.class.toUpperCase()} ${Math.round(o.confidence * 100)}%${extraTag}`;
       ctx.font = '600 11px -apple-system, sans-serif';
+      ctx.textAlign = 'left';
       const tw = ctx.measureText(label).width;
       const tagH = 20;
       const tagY = Math.max(0, y1 - tagH - 4);
@@ -300,11 +410,11 @@ function drawCamera() {
       ctx.beginPath();
       ctx.roundRect(x1, tagY, tw + 16, tagH, 4);
       ctx.fill();
-      ctx.strokeStyle = color;
+      ctx.strokeStyle = o.approaching ? red : color;
       ctx.lineWidth = 1;
       ctx.stroke();
 
-      ctx.fillStyle = color;
+      ctx.fillStyle = o.approaching ? '#fca5a5' : color;
       ctx.fillText(label, x1 + 8, tagY + 14);
     }
   }
@@ -430,12 +540,15 @@ function drawMap() {
   // 3. TESLA SURROUND PROXIMITY ARCS (6 Zones: L3, L2, L1, R1, R2, R3)
   const arcR = 340;
   const zoneNames = ['L3', 'L2', 'L1', 'R1', 'R2', 'R3'];
+  const showForecast = $('forecast') ? $('forecast').checked : true;
+  const predZones2s = (displayed && displayed.predicted_zones_2s) ? displayed.predicted_zones_2s : state?.predicted_zones_2s;
   for (let i = 0; i < 6; i++) {
     const a = startArc + (endArc - startArc) * i / 6;
     const b = startArc + (endArc - startArc) * (i + 1) / 6;
     const mid = (a + b) / 2;
     const currentZones = (displayed && displayed.zones) ? displayed.zones : state?.zones;
     const isActive = valid && currentZones && currentZones[i] === 1;
+    const isPredicted = valid && showForecast && !isActive && predZones2s && predZones2s[i] === 1;
 
     // Radial sector divider lines
     m.strokeStyle = '#1e293b';
@@ -475,6 +588,16 @@ function drawMap() {
       m.beginPath();
       m.arc(ox, oy, arcR + ripple * 22, a, b);
       m.stroke();
+    } else if (isPredicted) {
+      // Predicted +2s zone entry pre-alert arc
+      m.save();
+      m.setLineDash([6, 4]);
+      m.strokeStyle = amber;
+      m.lineWidth = 3;
+      m.beginPath();
+      m.arc(ox, oy, arcR, a, b);
+      m.stroke();
+      m.restore();
     } else {
       // Idle perimeter arc
       m.strokeStyle = '#1e293b';
@@ -488,13 +611,13 @@ function drawMap() {
     const labelR = arcR + 24;
     const lx = ox + Math.cos(mid) * labelR;
     const ly = oy + Math.sin(mid) * labelR;
-    m.fillStyle = isActive ? cyan : '#64748b';
-    m.font = `600 ${isActive ? '12px' : '11px'} -apple-system, sans-serif`;
+    m.fillStyle = isActive ? cyan : isPredicted ? amber : '#64748b';
+    m.font = `600 ${isActive || isPredicted ? '12px' : '11px'} -apple-system, sans-serif`;
     m.textAlign = 'center';
     m.fillText(zoneNames[i], lx, ly);
   }
 
-  // 4. DRAW TRACKED OBSTACLES (Smooth interpolation & decay)
+  // 4. DRAW TRACKED OBSTACLES & 3-SECOND PREDICTED RADAR TRAJECTORIES
   tracker.tracks.forEach(track => {
     if (track.alpha <= 0.01) return;
     m.save();
@@ -503,8 +626,36 @@ function drawMap() {
     const tx = track.currX;
     const ty = track.currY;
     const isPerson = track.class === 'person';
-    const color = isPerson ? cyan : amber;
+    const color = !track.realistic ? slate : (isPerson ? cyan : amber);
     const glow = isPerson ? cyanGlow : amberGlow;
+
+    // Draw 3-second future path on radar if enabled and realistic
+    if (showForecast && track.realistic && track.futureRadarPts && track.futureRadarPts.length > 0) {
+      m.save();
+      m.setLineDash([4, 4]);
+      m.strokeStyle = track.approaching ? red : '#38bdf8';
+      m.lineWidth = 2;
+      m.beginPath();
+      m.moveTo(tx, ty);
+      track.futureRadarPts.forEach(pt => m.lineTo(pt.x, pt.y));
+      m.stroke();
+      m.setLineDash([]);
+
+      track.futureRadarPts.forEach(pt => {
+        if (Math.hypot(pt.x - tx, pt.y - ty) > 6) {
+          m.fillStyle = track.approaching ? red : '#38bdf8';
+          m.beginPath();
+          m.arc(pt.x, pt.y, 3.5, 0, Math.PI * 2);
+          m.fill();
+          if (pt.dt === 2.0 || pt.dt === 3.0) {
+            m.font = '600 9px -apple-system, sans-serif';
+            m.textAlign = 'left';
+            m.fillText(`+${pt.dt}s`, pt.x + 6, pt.y + 3);
+          }
+        }
+      });
+      m.restore();
+    }
 
     if (isPerson) {
       // Tesla Pedestrian avatar
@@ -515,7 +666,7 @@ function drawMap() {
       m.fill();
 
       // Glowing safety halo
-      m.strokeStyle = glow;
+      m.strokeStyle = track.approaching ? 'rgba(239, 68, 68, 0.6)' : glow;
       m.lineWidth = 2;
       m.beginPath();
       m.arc(tx, ty, 18, 0, Math.PI * 2);
@@ -560,7 +711,8 @@ function drawMap() {
     }
 
     // HUD Label tag
-    const tagText = `${track.class.toUpperCase()} · ${track.distStr}`;
+    const ttcNote = track.ttc_s != null ? ` · TTC ${track.ttc_s.toFixed(1)}s` : '';
+    const tagText = `${track.class.toUpperCase()} · ${track.distStr}${ttcNote}`;
     m.font = '600 11px -apple-system, sans-serif';
     const tw = m.measureText(tagText).width;
     const pillW = tw + 16;
@@ -572,11 +724,11 @@ function drawMap() {
     m.beginPath();
     m.roundRect(pillX, pillY, pillW, pillH, 5);
     m.fill();
-    m.strokeStyle = color;
+    m.strokeStyle = track.approaching ? red : color;
     m.lineWidth = 1;
     m.stroke();
 
-    m.fillStyle = color;
+    m.fillStyle = track.approaching ? '#fca5a5' : color;
     m.textAlign = 'center';
     m.fillText(tagText, tx, pillY + 14);
 
@@ -663,6 +815,10 @@ function render() {
   const s = state;
   if (!s) return;
 
+  const f = displayed || s.frame;
+  const scen = f?.scenario || s.scenario;
+  const rifeInfo = f?.rife || s.rife;
+
   $('observation-title').textContent = s.mode === 'live' ? 'Forward vision stream' : s.mode === 'replay' ? 'Recorded stream' : 'Simulated stream';
   $('source').textContent = s.mode === 'live' ? 'LIVE VISION' : s.mode === 'replay' ? 'RECORDED' : 'SIMULATION';
   $('connection').textContent = s.status === 'live' ? (s.mode === 'live' ? '● Receiving frames' : '● Playing preview') : s.status;
@@ -673,6 +829,8 @@ function render() {
     message(`Notice: ${s.error} — attempting seamless reconnection…`, true);
   } else if (s.status === 'stale') {
     message('Sensor stream paused / waiting for new exposure…', false);
+  } else if (scen && scen.summary) {
+    message(scen.summary, scen.risk_level === 'collision_warning');
   } else if (s.mode !== 'live') {
     message(s.mode === 'replay' ? 'Recorded replay mode active.' : 'Simulated demo mode active.');
   } else {
@@ -687,32 +845,71 @@ function render() {
     $('rotate-select').value = String(s.rotate);
   }
 
-  const f = displayed || s.frame;
   if (f) {
     const rotLabel = s.rotate ? ` · ${s.rotate}° CW` : '';
-    $('resolution').textContent = `${f.width} × ${f.height}${rotLabel} · ${s.capture_fps ?? 0} FPS INGEST · ${renderFps} FPS UI`;
+    const streamFps = s.stream_fps || s.capture_fps || 0;
+    const rifeTag = rifeInfo?.rife_enabled ? ` · ${streamFps} FPS RIFE STREAM` : '';
+    $('resolution').textContent = `${f.width} × ${f.height}${rotLabel} · ${s.capture_fps ?? 0} FPS INGEST${rifeTag} · ${renderFps} FPS UI`;
     $('frame-label').textContent = `${s.mode === 'live' ? 'FRAME' : s.mode === 'replay' ? 'REPLAY' : 'DEMO'} ${f.frame_id} / ${s.status.toUpperCase()}`;
   }
 
-  // Directional Zones Pill - strictly synchronized to displayed frame
+  const badge = $('scenario-badge');
+  if (badge && scen) {
+    badge.classList.remove('warn', 'danger');
+    if (scen.risk_level === 'collision_warning') {
+      badge.classList.add('danger');
+      badge.textContent = `COLLISION RISK · TTC ${scen.min_ttc_s?.toFixed(1) ?? '<2'}s`;
+    } else if (!scen.realistic) {
+      badge.classList.add('warn');
+      badge.textContent = 'REALISM FILTER: NOISE SUPPRESSED';
+    } else if (scen.risk_level === 'approaching') {
+      badge.classList.add('warn');
+      badge.textContent = `3S FORECAST: APPROACHING (${Math.round(scen.realism_score * 100)}% REALISTIC)`;
+    } else {
+      badge.textContent = `3S REALISM: ${Math.round(scen.realism_score * 100)}% VERIFIED`;
+    }
+  }
+
+  // Directional Zones Pill - shows both active now (solid) and +2s predicted (dashed)
   const activeZones = (f && f.zones) ? f.zones : (s.zones || [-1, -1, -1, -1, -1, -1]);
-  $('zones').innerHTML = activeZones.map((z, i) => `
-    <div class="zone ${z === 1 ? 'active' : z === -1 ? 'unknown' : ''}">
-      ${['L3', 'L2', 'L1', 'R1', 'R2', 'R3'][i]} ${z === 1 ? '●' : z === -1 ? '?' : '·'}
-    </div>
-  `).join('');
+  const predZones2s = (f && f.predicted_zones_2s) ? f.predicted_zones_2s : (s.predicted_zones_2s || [0, 0, 0, 0, 0, 0]);
+  $('zones').innerHTML = activeZones.map((z, i) => {
+    const isPred = z === 0 && predZones2s && predZones2s[i] === 1;
+    const cls = z === 1 ? 'active' : isPred ? 'predicted' : z === -1 ? 'unknown' : '';
+    const sym = z === 1 ? '●' : isPred ? '◎' : z === -1 ? '?' : '·';
+    return `
+      <div class="zone ${cls}" title="${isPred ? 'Predicted to enter within 2.0s' : ''}">
+        ${['L3', 'L2', 'L1', 'R1', 'R2', 'R3'][i]} ${sym}
+      </div>
+    `;
+  }).join('');
 
   $('count').textContent = tracker.tracks.length;
-  $('latency').textContent = f?.processing_ms !== undefined ? `${Math.round(f.processing_ms)} ms` : '—';
-  $('timing-note').textContent = s.mode === 'replay' ? 'Recorded YOLO processing' : s.mode === 'simulation' ? 'Simulation latency' : `Camera ${Math.round(f?.capture_ms ?? 0)} ms · GPU ${Math.round(f?.processing_ms ?? 0)} ms`;
+  if ($('realism-note') && scen) {
+    $('realism-note').textContent = `${scen.confirmed_tracks ?? 0} realistic · ${scen.filtered_anomalies ?? 0} filtered`;
+  }
+  const procMs = f?.processing_ms ?? 0;
+  const rifeMs = rifeInfo?.rife_ms ?? 0;
+  const predMs = scen?.predict_ms ?? 0;
+  $('latency').textContent = f?.processing_ms !== undefined ? `${Math.round(procMs)} ms` : `${(rifeMs + predMs).toFixed(1)} ms`;
+  $('timing-note').textContent = s.mode === 'live'
+    ? `Cam ${Math.round(f?.capture_ms ?? 0)}ms · YOLO ${Math.round(procMs)}ms · RIFE ${rifeMs.toFixed(1)}ms`
+    : `RIFE ${rifeMs.toFixed(1)}ms (${rifeInfo?.backend || 'flow'}) · 3s Pred ${predMs.toFixed(2)}ms`;
   $('age-label').textContent = s.mode === 'live' ? 'Since exposure' : 'Since replay presentation';
   $('age').textContent = s.age_ms === null ? '—' : `${(s.age_ms / 1000).toFixed(1)} s`;
 
   const metric = !!s.calibration;
   $('map-title').textContent = metric ? 'Calibrated floor map' : 'Surround radar view';
   $('map-badge').textContent = metric ? 'METRIC ESTIMATE' : 'SURROUND RADAR';
-  $('mode-label').textContent = metric ? 'Floor estimate' : 'Surround radar';
-  $('mode-note').textContent = metric ? 'Metric distance in meters' : '6-zone directional bearings';
+  if (scen) {
+    const zNames = ['L3', 'L2', 'L1', 'R1', 'R2', 'R3'];
+    const p2 = (scen.predicted_zones_2s || []).map((v, idx) => v === 1 ? zNames[idx] : null).filter(Boolean);
+    $('mode-label').textContent = scen.realistic ? (scen.min_ttc_s ? `TTC ${scen.min_ttc_s.toFixed(1)}s` : 'Realistic') : 'Filtered';
+    $('mode-note').textContent = p2.length ? `+2s Predicted Zones: ${p2.join(', ')}` : 'No obstacle zone entry in +2s';
+  } else {
+    $('mode-label').textContent = metric ? 'Floor estimate' : 'Surround radar';
+    $('mode-note').textContent = metric ? 'Metric distance in meters' : '6-zone directional bearings';
+  }
 
   // Push detected objects into tracker matching displayed frame
   const activeObjects = (f && f.objects) ? f.objects : s.objects;
@@ -770,6 +967,19 @@ async function poll() {
 // EVENT HANDLERS & CALIBRATION
 // -------------------------------------------------------------
 $('boxes').onchange = () => {};
+if ($('forecast')) $('forecast').onchange = () => {};
+
+if ($('rife-select')) {
+  $('rife-select').onchange = async e => {
+    const factor = parseInt(e.target.value, 10);
+    try {
+      await post('/api/rife', { factor });
+      message(factor > 0 ? `RIFE optical-flow interpolation set to ${factor + 1}× smooth stream (${factor} intermediate frames).` : 'RIFE frame interpolation disabled (raw camera frame rate).');
+    } catch (err) {
+      message(err.message, true);
+    }
+  };
+}
 
 $('source-select').onchange = async e => {
   const mode = e.target.value;

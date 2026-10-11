@@ -15,21 +15,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageDraw
 from software.vision import Pipeline, MAX_BYTES, decode_jpeg, zone_states
+from software.predictor import RIFEInterpolator, TrajectoryPredictor
 from .geometry import calibration, project
 
 STATIC = Path(__file__).parent
 
 
 class StreamBroadcaster:
-    """Thread-safe fan-out broadcaster for live MJPEG stream clients."""
+    """Thread-safe fan-out broadcaster for live MJPEG stream clients with adaptive RIFE frame pacing."""
     def __init__(self):
         self._lock = threading.Lock()
         self._subscribers = []
         self._latest_jpeg = None
         self._cond = threading.Condition(self._lock)
+        self._pacer_seq = 0
 
     def subscribe(self):
-        q = deque(maxlen=2)
+        q = deque(maxlen=8)
         with self._lock:
             self._subscribers.append(q)
             if self._latest_jpeg is not None:
@@ -48,9 +50,34 @@ class StreamBroadcaster:
                 q.append(jpeg_bytes)
             self._cond.notify_all()
 
+    def broadcast_paced(self, frames_out, target_interval_s=0.20):
+        """Immediately broadcast first frame and evenly pace remaining intermediate/target frames across gap."""
+        if not frames_out:
+            return
+        with self._lock:
+            self._pacer_seq += 1
+            seq = self._pacer_seq
+        # Always broadcast the first frame immediately for zero-blocking responsiveness
+        self.broadcast(frames_out[0][0])
+        if len(frames_out) <= 1:
+            return
+        step_s = max(0.020, min(0.140, target_interval_s / float(len(frames_out))))
+        remaining = [f[0] for f in frames_out[1:]]
+
+        def _pace():
+            for jpeg_bytes in remaining:
+                time.sleep(step_s)
+                with self._lock:
+                    if self._pacer_seq != seq:
+                        return
+                self.broadcast(jpeg_bytes)
+
+        threading.Thread(target=_pace, daemon=True).start()
+
 
 class State:
-    def __init__(self, mode, output, max_age=2.5, config=None, rotate=0):
+    def __init__(self, mode, output, max_age=2.5, config=None, rotate=0,
+                 rife_factor=0, device='auto'):
         self.lock = threading.Lock()
         self.mode, self.output, self.max_age = mode, Path(output), max_age
         self.rotate = rotate
@@ -61,16 +88,59 @@ class State:
         self.config = config
         self.generation = 0
         self.arrivals = deque(maxlen=30)
+        self.stream_arrivals = deque(maxlen=90)
         self.broadcaster = StreamBroadcaster()
+        self.predictor = TrajectoryPredictor()
+        self.interpolator = RIFEInterpolator(factor=rife_factor, device=device)
 
-    def publish(self, data, result, started, generation):
+    def publish(self, data, result, started, generation, frame_bgr=None):
         with self.lock:
             if self.paused or generation != self.generation:
                 return
-            self.frame = {**result, 'image': base64.b64encode(data).decode('ascii')}
+            config = self.config
+            width = result.get('width', 640)
+            height = result.get('height', 480)
+            raw_objects = []
+            for obj in result.get('objects', []):
+                xy = project(obj['xyxy'], width, height, config) if config else None
+                raw_objects.append({
+                    **obj,
+                    'ground_xy': xy,
+                    'source': 'yolo',
+                    'position_kind': 'floor_estimate' if xy else 'bearing_only'
+                })
+            enriched_objects, scenario = self.predictor.update(
+                raw_objects, width, height, timestamp=started, calibration_config=config
+            )
+
+        frames_out, rife_info = self.interpolator.push_and_interpolate_jpegs(data, frame_bgr=frame_bgr)
+        now = time.monotonic()
+        with self.lock:
+            if self.paused or generation != self.generation:
+                return
+            if len(self.arrivals) >= 2:
+                span_n = min(len(self.arrivals) - 1, 4)
+                avg_gap_s = (now - self.arrivals[-span_n]) / span_n
+            elif len(self.arrivals) == 1:
+                avg_gap_s = now - self.arrivals[-1]
+            else:
+                avg_gap_s = 0.24
+            avg_gap_s = max(0.08, min(1.20, avg_gap_s))
+            self.frame = {
+                **result,
+                'objects': enriched_objects,
+                'scenario': scenario,
+                'predicted_zones_1s': scenario['predicted_zones_1s'],
+                'predicted_zones_2s': scenario['predicted_zones_2s'],
+                'predicted_zones_3s': scenario['predicted_zones_3s'],
+                'rife': rife_info,
+                'image': base64.b64encode(data).decode('ascii'),
+            }
             self.started, self.error = started, None
-            self.arrivals.append(time.monotonic())
-        self.broadcaster.broadcast(data)
+            self.arrivals.append(now)
+            for _ in frames_out:
+                self.stream_arrivals.append(now)
+        self.broadcaster.broadcast_paced(frames_out, target_interval_s=avg_gap_s)
 
     def snapshot(self):
         with self.lock:
@@ -85,11 +155,24 @@ class State:
                     xy = project(obj['xyxy'], frame['width'], frame['height'], config) if config else None
                     objects.append({**obj, 'ground_xy': xy, 'source': 'yolo',
                                     'position_kind': 'floor_estimate' if xy else 'bearing_only'})
+            capture_fps = (
+                round((len(self.arrivals)-1)/(self.arrivals[-1]-self.arrivals[0]),2)
+                if valid and len(self.arrivals)>1 and self.arrivals[-1]>self.arrivals[0] else 0
+            )
+            rife_mult = (1 + self.interpolator.factor) if self.interpolator.factor > 0 else 1
+            stream_fps = round(capture_fps * rife_mult, 2) if valid and capture_fps > 0 else 0
+            scenario = frame.get('scenario') if valid and frame else None
+            rife_info = frame.get('rife') if frame else {'rife_enabled': self.interpolator.factor > 0, 'factor': self.interpolator.factor, 'backend': self.interpolator.backend}
             return {'mode': self.mode, 'status': status, 'valid': valid,
                     'error': self.error, 'age_ms': round(age*1000) if age is not None else None,
                     'max_age_ms': round(self.max_age*1000), 'frame': frame,
-                    'capture_fps': round((len(self.arrivals)-1)/(self.arrivals[-1]-self.arrivals[0]),2)
-                    if valid and len(self.arrivals)>1 and self.arrivals[-1]>self.arrivals[0] else 0,
+                    'capture_fps': capture_fps,
+                    'stream_fps': stream_fps,
+                    'rife': rife_info,
+                    'scenario': scenario,
+                    'predicted_zones_1s': scenario['predicted_zones_1s'] if scenario else [-1]*6,
+                    'predicted_zones_2s': scenario['predicted_zones_2s'] if scenario else [-1]*6,
+                    'predicted_zones_3s': scenario['predicted_zones_3s'] if scenario else [-1]*6,
                     'objects': objects, 'zones': frame['zones'] if valid else [-1]*6,
                     'calibration': config, 'map_mode': 'floor_estimate' if config else 'bearing_only',
                     'rotate': self.rotate}
@@ -99,8 +182,11 @@ class State:
             self.paused = paused
             self.generation += 1
             self.arrivals.clear()
+            self.stream_arrivals.clear()
             # A resume must wait for a newly captured frame.
             self.started = None
+        self.predictor.reset()
+        self.interpolator.reset()
 
     def set_rotate(self, rotate):
         with self.lock:
@@ -109,7 +195,10 @@ class State:
             self.rotate = rotate
             self.generation += 1
             self.arrivals.clear()
+            self.stream_arrivals.clear()
             self.started = None
+        self.predictor.reset()
+        self.interpolator.reset()
 
     def set_mode(self, mode):
         with self.lock:
@@ -119,8 +208,19 @@ class State:
             self.rotate = 270 if mode == 'live' else 0
             self.generation += 1
             self.arrivals.clear()
+            self.stream_arrivals.clear()
             self.started = None
             self.error = None
+        self.predictor.reset()
+        self.interpolator.reset()
+
+    def set_rife(self, factor):
+        if type(factor) is not int or not 0 <= factor <= 8:
+            raise ValueError('rife factor must be an integer between 0 and 8')
+        with self.lock:
+            self.interpolator.factor = factor
+            self.interpolator.stats['factor'] = factor
+        self.interpolator.reset()
 
 
 
@@ -146,21 +246,30 @@ class SnapshotCamera:
     """Reuse the camera HTTP connection; reconnect only when it closes or fails."""
     def __init__(self, url, timeout):
         self.url = urllib.parse.urlsplit(url)
-        self.timeout = timeout
+        self.timeout = min(float(timeout), 2.5) if timeout > 0 else timeout
         self.cls = http.client.HTTPSConnection if self.url.scheme == 'https' else http.client.HTTPConnection
-        self.connection = self.cls(self.url.hostname, self.url.port, timeout=timeout)
+        self.connection = self.cls(self.url.hostname, self.url.port, timeout=self.timeout)
 
     def _request_once(self):
+        if self.connection.sock is not None:
+            try:
+                self.connection.sock.settimeout(min(self.timeout, 1.4))
+            except OSError:
+                pass
         query = self.url.query + ('&' if self.url.query else '') + '_cb=' + str(time.time_ns())
         path = urllib.parse.urlunsplit(('', '', self.url.path or '/', query, ''))
         self.connection.request('GET', path, headers={'Cache-Control': 'no-cache', 'Accept': 'image/jpeg'})
         response = self.connection.getresponse()
         if response.status != 200:
+            response.close()
             raise OSError(f'Camera HTTP {response.status}')
         data = response.read(MAX_BYTES + 1)
+        will_close = getattr(response, 'will_close', False)
+        response.close()
+        if will_close:
+            self.close()
         if len(data) > MAX_BYTES:
             raise ValueError('Camera JPEG exceeds the size limit')
-        response.close()
         return data
 
     def read(self):
@@ -169,7 +278,7 @@ class SnapshotCamera:
             return self._request_once()
         except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError,
                 http.client.BadStatusLine, http.client.CannotSendRequest,
-                http.client.ResponseNotReady) as exc:
+                http.client.ResponseNotReady, TimeoutError) as exc:
             self.close()
             if had_socket:
                 self.connection = self.cls(self.url.hostname, self.url.port, timeout=self.timeout)
@@ -322,7 +431,8 @@ def run_source(state, args, stop):
                 model=args.model,
                 device=args.device,
                 max_result_age_ms=args.max_age * 1000,
-                save_disk=getattr(args, 'save_artifacts', False)
+                save_disk=getattr(args, 'save_artifacts', False),
+                predict_horizon=False
             )
 
             # Dedicated producer thread reads camera continuously without blocking YOLO
@@ -330,8 +440,8 @@ def run_source(state, args, stop):
                 consecutive_errors = 0
                 while not stop.is_set():
                     with state.lock:
-                        paused = state.paused
-                    if paused:
+                        paused, current_mode = state.paused, state.mode
+                    if paused or current_mode != 'live':
                         if camera: camera.close()
                         stop.wait(0.1)
                         continue
@@ -341,12 +451,13 @@ def run_source(state, args, stop):
                         fetched = time.monotonic()
                         buffer.put((raw, started, fetched))
                         consecutive_errors = 0
+                        stop.wait(0.015)
                     except Exception as exc:
                         consecutive_errors += 1
                         with state.lock:
-                            if consecutive_errors >= 2:
+                            if consecutive_errors >= 4 or (state.frame is None and consecutive_errors >= 2):
                                 state.error = str(exc)
-                        stop.wait(0.35 if consecutive_errors else 0.01)
+                        stop.wait(0.12 if consecutive_errors < 4 else 0.30)
                 if camera:
                     camera.close()
 
@@ -395,6 +506,7 @@ def run_source(state, args, stop):
                 continue
 
             try:
+                frame_bgr = None
                 if current_mode == 'live' and args.camera_url:
                     item, _, gen = buffer.get(last_gen, timeout=0.1)
                     if item is None or gen == last_gen:
@@ -402,6 +514,8 @@ def run_source(state, args, stop):
                     last_gen = gen
                     raw, started, fetched = item
                     rotated_jpeg, image_input, w, h = prepare_frame_and_rotate(raw, rotate)
+                    if image_input is not None and hasattr(image_input, 'shape'):
+                        frame_bgr = image_input
                     result = pipeline.process(
                         rotated_jpeg,
                         str(index + 1),
@@ -421,7 +535,7 @@ def run_source(state, args, stop):
                     stop.wait(0.04)
 
                 result['frame_id'] = index + 1
-                state.publish(raw_to_publish, result, started, generation)
+                state.publish(raw_to_publish, result, started, generation, frame_bgr=frame_bgr)
                 index += 1
             except Exception as exc:
                 with state.lock:
@@ -479,7 +593,7 @@ def handler_for(state):
                         with state.broadcaster._lock:
                             if not q:
                                 state.broadcaster._cond.wait(timeout=0.2)
-                            jpeg = q.pop() if q else None
+                            jpeg = q.popleft() if q else None
                         if jpeg:
                             header = (
                                 b'--frame\r\n'
@@ -527,6 +641,11 @@ def handler_for(state):
                     if m not in ('live','simulation','replay'):
                         raise ValueError('mode must be live, simulation, or replay')
                     state.set_mode(m)
+                elif self.path=='/api/rife':
+                    factor=payload.get('factor')
+                    if type(factor) is not int or not 0 <= factor <= 8:
+                        raise ValueError('factor must be an integer between 0 and 8')
+                    state.set_rife(factor)
                 elif self.path=='/api/calibration':
                     config=None if payload.get('clear') is True else calibration(payload)
                     if config and state.mode=='live':
@@ -553,6 +672,7 @@ def main():
     p.add_argument('--port',type=int,default=8080)
     p.add_argument('--model',default='yolo26n.pt');p.add_argument('--device',default='0')
     p.add_argument('--rotate',type=int,choices=[0,90,180,270],default=None,help='Clockwise rotation before detection (default: 270 for live, 0 for simulation/replay)')
+    p.add_argument('--rife-factor',type=int,default=0,help='RIFE optical-flow intermediate frames per capture (default: 0 / Off)')
     p.add_argument('--stream',action='store_true',help='Force continuous multipart MJPEG video stream ingestion')
     p.add_argument('--save-artifacts',action='store_true',help='Save diagnostic artifacts (latest.jpg, latest.json) to disk')
     p.add_argument('--interval',type=float,default=None,help='Delay after each frame; live defaults to 0, replay/demo to 0.5 s')
@@ -577,8 +697,8 @@ def main():
         args.rotate = 270 if mode == 'live' else 0
     if args.interval is None: args.interval=0.04 if args.camera_url else .5
     if (not 1 <= args.port <= 65535 or not all(math.isfinite(v) for v in (args.interval,args.timeout,args.max_age))
-            or args.interval < 0 or args.timeout <= 0 or args.max_age <= 0):
-        p.error('Invalid port or timing settings.')
+            or args.interval < 0 or args.timeout <= 0 or args.max_age <= 0 or not 0 <= args.rife_factor <= 8):
+        p.error('Invalid port, timing, or RIFE factor settings.')
     if args.camera_url and urllib.parse.urlsplit(args.camera_url).scheme not in ('http','https'):
         p.error('Camera URL must use HTTP or HTTPS.')
     try:
@@ -588,7 +708,7 @@ def main():
         config=calibration(payload) if payload else None
     except (ValueError,OSError) as exc:
         p.error(str(exc))
-    state=State(mode,args.output,args.max_age,config,rotate=args.rotate);stop=threading.Event()
+    state=State(mode,args.output,args.max_age,config,rotate=args.rotate,rife_factor=args.rife_factor,device=args.device);stop=threading.Event()
     server=ThreadingHTTPServer(('127.0.0.1',args.port),handler_for(state))
     worker=threading.Thread(target=run_source,args=(state,args,stop),daemon=True);worker.start()
     print(f'YOLO dashboard: http://127.0.0.1:{args.port} ({mode})',flush=True)

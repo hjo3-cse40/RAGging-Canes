@@ -59,8 +59,19 @@
                 <option value="180">180°</option>
               </select>
             </label>
+            <label class="toggle" title="RIFE optical-flow intermediate frame synthesis">
+              <span class="control-label">RIFE:</span>
+              <select id="rife-select" class="select-input" aria-label="RIFE interpolation factor">
+                <option value="0" selected>Off (Raw FPS)</option>
+                <option value="1">2× Smooth (1 mid)</option>
+                <option value="3">4× Smooth (3 mid)</option>
+              </select>
+            </label>
             <label class="toggle">
               <input id="boxes" type="checkbox" checked> YOLO detections
+            </label>
+            <label class="toggle" title="Show 3-second trajectory rollout and future ghost boxes">
+              <input id="forecast" type="checkbox" checked> 3s Forecast
             </label>
           </div>
         </div>
@@ -68,13 +79,14 @@
           <img id="stream-img" src="/stream.mjpg" hidden style="display:none;" alt="Live camera stream" crossorigin="anonymous">
           <canvas id="camera" width="640" height="480" aria-label="Camera image with YOLO boxes and calibration points"></canvas>
           <div class="stage-tag" id="frame-label">WAITING FOR SENSOR</div>
+          <div class="stage-tag right-tag" id="scenario-badge">3S REALISM: STANDBY</div>
         </div>
         <div class="camera-footer">
           <span id="resolution">—</span>
-          <span id="classes">PERSON + CHAIR DETECTOR</span>
+          <span id="classes">YOLO26N + RIFE + 3S KALMAN PREDICTOR</span>
         </div>
         <div class="zones-head">
-          <span>SURROUND DIRECTIONAL ZONES</span>
+          <span>SURROUND DIRECTIONAL ZONES (SOLID = NOW · DASHED = +2S PREDICTED)</span>
           <span>Left → Right (L3…R3)</span>
         </div>
         <div class="zones" id="zones"></div>
@@ -95,9 +107,10 @@
         <div class="legend">
           <span><i class="dot mint"></i>Person</span>
           <span><i class="dot amber"></i>Chair / Obstacle</span>
+          <span><i class="dot forecast-dot"></i>3s Predicted Path</span>
           <span><i class="dot outline"></i>Sensor Perimeter</span>
         </div>
-        <p id="map-note" class="map-note">Continuous surrounding perception view. Distance and bearings update in real time.</p>
+        <p id="map-note" class="map-note">Continuous surrounding perception view. Distance, 3-second trajectories, and realism filter update in real time.</p>
       </section>
     </div>
 
@@ -106,12 +119,12 @@
       <div>
         <span>ACTIVE TARGETS</span>
         <strong id="count">—</strong>
-        <small>Tracked in surround view</small>
+        <small id="realism-note">Tracked &amp; realism-verified</small>
       </div>
       <div>
         <span>PIPELINE LATENCY</span>
         <strong id="latency">—</strong>
-        <small id="timing-note">YOLO + Camera transfer</small>
+        <small id="timing-note">YOLO + RIFE + 3s Predictor</small>
       </div>
       <div>
         <span>FRAME FRESHNESS</span>
@@ -119,7 +132,7 @@
         <small id="age-label">Since exposure</small>
       </div>
       <div>
-        <span>PERCEPTION MODE</span>
+        <span>3S SCENARIO FORECAST</span>
         <strong id="mode-label" class="text-metric">Surround radar</strong>
         <small id="mode-note">6-zone directional tracking</small>
       </div>
